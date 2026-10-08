@@ -1553,10 +1553,10 @@ async fn main() {
         punch: 0.0,
         pan_last: None,
         elo,
-        elo_disp: 0.0,
+        elo_disp: elo, // start settled: no sweep through every tier on launch
         elo_vel: 0.0,
         elo_drag: false,
-        tier: 0,
+        tier: tier(elo),
         tier_pop: 0.0,
         tick_pop: 0.0,
         game_id: 0,
