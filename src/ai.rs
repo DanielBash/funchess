@@ -22,6 +22,8 @@ pub enum Reply {
 }
 
 pub const MAGNUS: f32 = 2850.0;
+/// Top of the slider: "Theoretical Human".
+pub const MAX_ELO: f32 = 3500.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mood {
@@ -180,8 +182,9 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
     //    human makes, using real best/good/inaccuracy/mistake/blunder rates for this
     //    rating band and clock situation (from Lichess games with computer analysis).
     let hurry = clock.map_or(0.0, |t| ((20.0 - t) / 20.0).clamp(0.0, 1.0));
-    let depth = ((12.0 * (1.0 - 0.5 * hurry)) as u32).max(2);
-    let movetime = (2500.0 * (1.0 - 0.9 * hurry)) as u32;
+    let beyond = (e - MAGNUS).max(0.0);
+    let depth = (((12.0 + beyond / 100.0) * (1.0 - 0.5 * hurry)) as u32).max(2);
+    let movetime = ((2500.0 + beyond * 4.0) * (1.0 - 0.9 * hurry)) as u32;
     let lines = search(inp, out, pos, 40, &format!("depth {depth} movetime {movetime}"));
     let Some(&(best_mv, best)) = lines.first() else { return (None, None, Mood::Calm) };
 
@@ -197,9 +200,12 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
     if profile.iter().sum::<u32>() == 0 {
         profile[0] = 1;
     }
-    let total: u32 = profile.iter().sum();
-    let mut r = gen_range(0, total.max(1));
-    let mut target = profile.iter().position(|&c| r < c || { r -= c; false }).unwrap_or(0);
+    let mut weights: Vec<f32> = profile.iter().map(|&c| c as f32).collect();
+    let slip = slip_factor(bk, e, book::phase(pos, ply), book::pressure(clock));
+    weights[1..].iter_mut().for_each(|w| *w *= slip);
+    let total: f32 = weights.iter().sum();
+    let mut r = gen_range(0.0, total);
+    let mut target = weights.iter().position(|&w| r < w || { r -= w; false }).unwrap_or(0);
     if e < 400.0 && gen_range(0.0, 1.0) < (400.0 - e) / 800.0 {
         target = book::CATS - 1; // below the data: pure potato chaos
     }
@@ -321,6 +327,37 @@ fn is_blunder(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &C
 pub fn book() -> &'static book::Book {
     static BOOK: std::sync::OnceLock<book::Book> = std::sync::OnceLock::new();
     BOOK.get_or_init(|| book::Book::read(include_bytes!("../assets/book.bin")).unwrap_or_default())
+}
+
+/// Above the data (2500+ band, centred ~2650): how much rarer slips get. Up to ~3200
+/// this follows the trend fitted on the 1800..2500+ bands for this phase and clock;
+/// the last tier fades slips out entirely: a "theoretical human" who never errs but
+/// still picks moves the way a person would.
+fn slip_factor(bk: &book::Book, e: f32, phase: usize, pressure: usize) -> f32 {
+    const CENTRES: [f32; 4] = [1900.0, 2100.0, 2350.0, 2650.0];
+    if e <= 2650.0 {
+        return 1.0;
+    }
+    let pts: Vec<(f32, f32)> = (6..10)
+        .filter_map(|b| {
+            let c = bk.errors[b][phase][pressure];
+            let total: u32 = c.iter().sum();
+            (total >= 200 && c[0] < total).then(|| (CENTRES[b - 6], (1.0 - c[0] as f32 / total as f32).ln()))
+        })
+        .collect();
+    // least-squares slope of ln(slip share) vs rating
+    let slope = if pts.len() >= 2 {
+        let n = pts.len() as f32;
+        let (mx, my) = (pts.iter().map(|p| p.0).sum::<f32>() / n, pts.iter().map(|p| p.1).sum::<f32>() / n);
+        let cov: f32 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+        let var: f32 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        (cov / var).min(-0.0003)
+    } else {
+        -0.001
+    };
+    let trend = (slope * (e.min(3200.0) - 2650.0)).exp();
+    let fade = ((e - 3200.0) / 300.0).clamp(0.0, 1.0);
+    trend * (1.0 - fade * fade * (3.0 - 2.0 * fade))
 }
 
 /// How many enemy attacks land on the king and the squares around it.
@@ -476,7 +513,7 @@ mod tests {
     fn every_elo_returns_a_legal_move() {
         let e = spawn().unwrap();
         let pos = Chess::default();
-        for elo in [1.0, 800.0, 1600.0, 2400.0, MAGNUS] {
+        for elo in [1.0, 800.0, 1600.0, 2400.0, MAGNUS, MAX_ELO] {
             e.tx.send(Req::Think { game_id: 0, pos: pos.clone(), elo, clock: Some(5.0) }).unwrap();
             let Reply::Move { mv, .. } = e.rx.recv().unwrap() else { panic!() };
             assert!(pos.is_legal(mv.unwrap()), "elo {elo}");
@@ -546,4 +583,14 @@ fn replays_real_games_move_for_move() {
         assert_eq!((book::encode(mv), ch, url.len() > 20), (code, Some(0), true), "ply {ply}");
         pos.play_unchecked(mv);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn beyond_magnus_slips_less_and_theoretical_human_never_does() {
+    let bk = book();
+    let f: Vec<f32> = [2600.0, MAGNUS, 3000.0, 3200.0, 3400.0, MAX_ELO].iter().map(|&e| slip_factor(bk, e, 1, 0)).collect();
+    println!("middlegame slip factor: {f:?}");
+    assert!(f.windows(2).all(|w| w[1] <= w[0]), "{f:?}");
+    assert_eq!(f[5], 0.0);
 }

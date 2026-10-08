@@ -2,17 +2,17 @@
 mod ai;
 mod book;
 mod overlay;
+mod skins;
 
-use ai::{Grade, MAGNUS};
+use ai::{Grade, MAGNUS, MAX_ELO};
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
 use shakmaty::{Chess, Color as Side, File, Move, Piece, Position, Rank, Role, Square};
 use std::f32::consts::PI;
 
-const SQ: f32 = 80.0;
-const BOARD: f32 = SQ * 8.0;
+use skins::{BOARD, SQ};
 const PANEL: f32 = 340.0;
-const STRIP: f32 = 56.0;
+const STRIP: f32 = 100.0;
 /// Practice lines: the bot sticks to these while you do, then continues like real players would.
 const OPENINGS: [(&str, &str); 14] = [
     ("Any (bots play like humans)", ""),
@@ -34,7 +34,8 @@ const OPENINGS: [(&str, &str); 14] = [
 /// (label, base seconds, increment)
 const TCS: [(&str, f32, f32); 5] = [("No clock", 0.0, 0.0), ("1+0", 60.0, 0.0), ("3+2", 180.0, 2.0), ("5+0", 300.0, 0.0), ("10+0", 600.0, 0.0)];
 
-const TIERS: [(f32, &str, [f32; 3]); 9] = [
+const MAGNUS_TIER: usize = 8;
+const TIERS: [(f32, &str, [f32; 3]); 12] = [
     (0.0, "Potato", [0.55, 0.8, 0.35]),
     (400.0, "Beginner", [0.3, 0.85, 0.55]),
     (800.0, "Casual", [0.25, 0.8, 0.85]),
@@ -44,6 +45,10 @@ const TIERS: [(f32, &str, [f32; 3]); 9] = [
     (2300.0, "Master", [1.0, 0.35, 0.5]),
     (2500.0, "Grandmaster", [1.0, 0.55, 0.2]),
     (MAGNUS - 20.0, "MAGNUS CARLSEN", [1.0, 0.84, 0.2]),
+    // beyond Magnus: same human style, mistakes extrapolated from the data, then faded out
+    (2950.0, "Beyond Magnus", [0.55, 1.0, 0.85]),
+    (3150.0, "Peak Human", [0.6, 0.85, 1.0]),
+    (3350.0, "Theoretical Human", [1.0, 1.0, 1.0]),
 ];
 
 fn tier(e: f32) -> usize {
@@ -53,7 +58,7 @@ fn tier(e: f32) -> usize {
 fn elo_color(e: f32) -> Color {
     let i = tier(e);
     let (a, ca) = (TIERS[i].0, TIERS[i].2);
-    let (b, cb) = TIERS.get(i + 1).map_or((MAGNUS, ca), |t| (t.0, t.2));
+    let (b, cb) = TIERS.get(i + 1).map_or((MAX_ELO, ca), |t| (t.0, t.2));
     let t = ((e - a) / (b - a).max(1.0)).clamp(0.0, 1.0);
     Color::new(ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t, 1.0)
 }
@@ -133,6 +138,14 @@ struct Anim {
     tag: Option<String>,
 }
 
+/// "From position" board editor.
+struct Editor {
+    board: shakmaty::Board,
+    turn: Side,
+    brush: Option<Piece>,
+    err: Option<String>,
+}
+
 struct App {
     pos: Chess,
     history: Vec<Chess>,
@@ -165,6 +178,11 @@ struct App {
     pending: Option<(Move, Option<String>, f64)>,
     over_t: f32,
     engine: ai::Engine,
+    skin: usize,
+    skin_tex: Option<Texture2D>,
+    grass: Option<skins::Grass>,
+    editor: Option<Editor>,
+    saved: (f32, usize, usize),
     played: Vec<Move>,
     opening: usize,
     opening_name: Option<(String, f32)>,
@@ -240,6 +258,44 @@ impl App {
         self.engine.stop();
     }
 
+    fn set_skin(&mut self, skin: usize) {
+        self.skin = skin % skins::SKINS.len();
+        self.skin_tex = skins::texture(self.skin);
+        self.grass = (self.skin == skins::GRASS).then(skins::Grass::new);
+    }
+
+    fn save_settings(&mut self) {
+        let now = (self.elo.round(), self.skin, self.tc);
+        if now != self.saved && !self.elo_drag {
+            self.saved = now;
+            if let Some(p) = settings_path() {
+                let _ = std::fs::create_dir_all(p.parent().unwrap());
+                let _ = std::fs::write(p, format!("elo={}\nskin={}\ntc={}\n", now.0, now.1, now.2));
+            }
+        }
+    }
+
+    fn editor_play(&mut self, side: Side) {
+        let Some(ed) = &mut self.editor else { return };
+        let fen = format!("{} {} KQkq - 0 1", ed.board, if ed.turn == Side::White { "w" } else { "b" });
+        let pos = fen
+            .parse::<shakmaty::fen::Fen>()
+            .map_err(|e| e.to_string())
+            .and_then(|f| match f.into_position::<Chess>(shakmaty::CastlingMode::Standard) {
+                Ok(p) => Ok(p),
+                Err(e) => e.ignore_invalid_castling_rights().map_err(|e| e.to_string()),
+            });
+        match pos {
+            Ok(p) => {
+                self.editor = None;
+                self.new_game(side);
+                self.pos = p;
+                self.opening_name = Some(("Custom position".into(), 0.0));
+            }
+            Err(e) => ed.err = Some(format!("Not a legal position: {e}")),
+        }
+    }
+
     fn board_alpha(&self) -> f32 {
         if self.overlay.is_some() { 0.88 } else { 1.0 }
     }
@@ -258,7 +314,7 @@ impl App {
         let mut args = vec!["--fen".to_string(), fen, "--side".into(), (if self.player == Side::White { "w" } else { "b" }).into()];
         args.extend(["--elo".into(), format!("{:.0}", self.elo), "--tc".into(), self.tc.to_string()]);
         args.extend(["--clock".into(), format!("{},{}", self.clock[0], self.clock[1])]);
-        args.extend(["--opening".into(), self.opening.to_string()]);
+        args.extend(["--opening".into(), self.opening.to_string(), "--skin".into(), self.skin.to_string()]);
         if overlay {
             args.push("--overlay".into());
         }
@@ -370,7 +426,7 @@ impl App {
 
     fn knob_y(&self) -> f32 {
         let b = self.bar_rect();
-        let f = ((self.elo_disp - 1.0) / (MAGNUS - 1.0)).clamp(-0.03, 1.03);
+        let f = ((self.elo_disp - 1.0) / (MAX_ELO - 1.0)).clamp(-0.03, 1.03);
         b.y + b.h * (1.0 - f)
     }
 
@@ -467,6 +523,9 @@ impl App {
             let col = if p.color.is_white() { Color::new(0.98, 0.95, 0.88, 1.0) } else { Color::new(0.15, 0.15, 0.2, 1.0) };
             self.burst(at, col, 30, 260.0, false);
             self.burst(at, ORANGE, 10, 180.0, false);
+            if let Some(g) = &mut self.grass {
+                g.blast(at, 1.0);
+            }
             self.shake += 7.0;
             self.punch += 0.035;
         } else {
@@ -509,14 +568,14 @@ impl App {
             self.elo_drag = false;
         }
         if self.elo_drag {
-            self.elo = ((bar.y + bar.h - mouse.y) / bar.h).clamp(0.0, 1.0) * (MAGNUS - 1.0) + 1.0;
+            self.elo = ((bar.y + bar.h - mouse.y) / bar.h).clamp(0.0, 1.0) * (MAX_ELO - 1.0) + 1.0;
         }
         if wheel != 0.0 && !on_board_side {
-            self.elo = (self.elo + wheel.signum() * 25.0).clamp(1.0, MAGNUS);
+            self.elo = (self.elo + wheel.signum() * 25.0).clamp(1.0, MAX_ELO);
         }
         if is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Down) {
             let d = if is_key_pressed(KeyCode::Up) { 100.0 } else { -100.0 };
-            self.elo = (self.elo + d).clamp(1.0, MAGNUS);
+            self.elo = (self.elo + d).clamp(1.0, MAX_ELO);
         }
         let prev = self.elo_disp;
         let acc = 240.0 * (self.elo - self.elo_disp) - 15.0 * self.elo_vel;
@@ -525,16 +584,16 @@ impl App {
         if (self.elo_disp / 100.0).floor() != (prev / 100.0).floor() {
             self.tick_pop = 1.0;
         }
-        let t = tier(self.elo_disp.clamp(1.0, MAGNUS));
+        let t = tier(self.elo_disp.clamp(1.0, MAX_ELO));
         if t != self.tier {
             let up = t > self.tier;
             self.tier = t;
             self.tier_pop = 1.0;
-            let at = if self.overlay.is_some() { vec2(130.0, sh - STRIP / 2.0) } else { vec2(bar.center().x, self.knob_y()) };
+            let at = if self.overlay.is_some() { vec2(150.0, sh - STRIP + 20.0) } else { vec2(bar.center().x, self.knob_y()) };
             let n = if up { 20 + t * 8 } else { 12 };
             self.burst(at, elo_color(self.elo_disp), n, 220.0 + t as f32 * 40.0, true);
         }
-        if self.tier == TIERS.len() - 1 && self.overlay.is_none() && gen_range(0.0, 1.0) < 0.5 {
+        if self.tier >= MAGNUS_TIER && self.overlay.is_none() && gen_range(0.0, 1.0) < 0.5 {
             let at = vec2(bar.center().x + gen_range(-30.0, 30.0), bar.y - 30.0 + gen_range(-20.0, 20.0));
             self.burst(at, GOLD, 1, 60.0, true);
         }
@@ -568,6 +627,22 @@ impl App {
         self.shake *= (-dt * 9.0).exp();
         self.punch *= (-dt * 7.0).exp();
 
+        // --- grass: cursor, dragged and sliding pieces brush through it ---
+        if let Some(g) = &mut self.grass {
+            let mut pushers = vec![];
+            if on_board_side {
+                pushers.push((wm, 30.0));
+            }
+            if self.dragging {
+                pushers.push((wm, 42.0));
+            }
+            if let Some(a) = &self.anim {
+                let e = 1.0 - (1.0 - a.t.clamp(0.0, 1.0)).powi(3);
+                pushers.extend(a.slides.iter().map(|s| (s.from.lerp(s.to, e), 46.0)));
+            }
+            g.update(dt, get_time() as f32, &pushers);
+        }
+
         // --- animations / fx ---
         if let Some(a) = &mut self.anim {
             a.t += dt / if a.fx { 0.26 } else { 0.14 };
@@ -600,6 +675,11 @@ impl App {
         }
         if over && self.anim.is_none() {
             self.over_t += dt;
+        }
+
+        if self.editor.is_some() {
+            self.update_editor(on_board_side, wm);
+            return;
         }
 
         // --- player input ---
@@ -709,7 +789,7 @@ impl App {
         // --- overlay: drag window by the grip, tell the OS which pixels are clickable ---
         if self.overlay.is_some() {
             let win: Vec2 = { let p = miniquad::window::get_window_position(); vec2(p.0 as f32, p.1 as f32) };
-            if is_mouse_button_pressed(MouseButton::Left) && Rect::new(0.0, sh - STRIP, 40.0, STRIP).contains(mouse) {
+            if is_mouse_button_pressed(MouseButton::Left) && Rect::new(0.0, sh - STRIP, 46.0, 46.0).contains(mouse) {
                 self.win_drag = Some((win + mouse, win));
             }
             if !is_mouse_button_down(MouseButton::Left) {
@@ -746,6 +826,111 @@ impl App {
         }
     }
 
+    fn update_editor(&mut self, on_board_side: bool, wm: Vec2) {
+        let sq = if on_board_side { self.world_sq(wm) } else { None };
+        let ed = self.editor.as_mut().unwrap();
+        if let (Some(sq), true) = (sq, is_mouse_button_pressed(MouseButton::Left)) {
+            match ed.brush {
+                Some(p) if ed.board.piece_at(sq) != Some(p) => ed.board.set_piece_at(sq, p),
+                _ => ed.board.discard_piece_at(sq),
+            }
+            ed.err = None;
+        }
+    }
+
+    fn draw_editor_world(&self, wm: Vec2) {
+        let ed = self.editor.as_ref().unwrap();
+        skins::draw_base(self.skin, self.skin_tex.as_ref(), 1.0, get_time() as f32);
+        if let Some(g) = &self.grass {
+            g.draw(1.0);
+        }
+        self.draw_coords();
+        for (sq, p) in ed.board.iter() {
+            self.draw_piece(p, self.sq_pos(sq), 1.0, 1.0);
+        }
+        if let Some(sq) = self.world_sq(wm) {
+            let c = self.sq_pos(sq);
+            draw_rectangle_lines(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, 4.0, Color::new(0.3, 0.8, 1.0, 0.8));
+            if let Some(p) = ed.brush {
+                self.draw_piece(p, c, 0.9, 0.45);
+            }
+        }
+    }
+
+    fn draw_editor_panel(&mut self) {
+        let (sw, sh) = (screen_width(), screen_height());
+        let x0 = sw - PANEL;
+        draw_rectangle(x0, 0.0, PANEL, sh, Color::from_rgba(28, 28, 36, 255));
+        self.text("SET UP A POSITION", x0 + 30.0, 44.0, 18.0, WHITE, true);
+        self.text("pick a piece, click squares (click again to remove)", x0 + 30.0, 68.0, 12.0, GRAY, false);
+        let roles = [Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn];
+        let mut pick = None;
+        for (row, color) in [Side::White, Side::Black].into_iter().enumerate() {
+            for (i, role) in roles.into_iter().enumerate() {
+                let r = Rect::new(x0 + 30.0 + i as f32 * 47.0, 90.0 + row as f32 * 52.0, 44.0, 48.0);
+                let p = Piece { color, role };
+                let on = self.editor.as_ref().unwrap().brush == Some(p);
+                draw_rectangle(r.x, r.y, r.w, r.h, if on { Color::from_rgba(80, 110, 160, 255) } else { Color::from_rgba(50, 50, 64, 255) });
+                self.draw_piece(p, r.center(), 0.62, 1.0);
+                if r.contains(mouse_position().into()) && is_mouse_button_pressed(MouseButton::Left) {
+                    pick = Some(Some(p));
+                }
+            }
+        }
+        let bw = PANEL - 60.0;
+        let half = bw / 2.0 - 5.0;
+        let row = |i: f32| 204.0 + i * 54.0;
+        if self.button(Rect::new(x0 + 30.0, row(0.0), bw, 44.0), "Eraser") {
+            pick = Some(None);
+        }
+        let turn = self.editor.as_ref().unwrap().turn;
+        if self.button(Rect::new(x0 + 30.0, row(1.0), bw, 44.0), &format!("To move: {}", if turn == Side::White { "White" } else { "Black" })) {
+            let ed = self.editor.as_mut().unwrap();
+            ed.turn = !ed.turn;
+        }
+        if self.button(Rect::new(x0 + 30.0, row(2.0), half, 44.0), "Paste FEN") {
+            let ed = self.editor.as_mut().unwrap();
+            let text = miniquad::window::clipboard_get().unwrap_or_default();
+            match text.trim().parse::<shakmaty::fen::Fen>() {
+                Ok(f) => {
+                    let setup = f.into_setup();
+                    ed.board = setup.board;
+                    ed.turn = setup.turn;
+                    ed.err = None;
+                }
+                Err(e) => ed.err = Some(format!("Clipboard isn't a FEN ({e})")),
+            }
+        }
+        if self.button(Rect::new(x0 + 35.0 + half, row(2.0), half, 44.0), "Clear") {
+            self.editor.as_mut().unwrap().board = shakmaty::Board::empty();
+        }
+        if self.button(Rect::new(x0 + 30.0, row(3.0), bw, 44.0), "Starting position") {
+            let ed = self.editor.as_mut().unwrap();
+            ed.board = shakmaty::Board::new();
+            ed.turn = Side::White;
+        }
+        if self.button(Rect::new(x0 + 30.0, row(4.0), half, 44.0), "Play White") {
+            self.editor_play(Side::White);
+        }
+        if self.button(Rect::new(x0 + 35.0 + half, row(4.0), half, 44.0), "Play Black") {
+            self.editor_play(Side::Black);
+        }
+        if self.button(Rect::new(x0 + 30.0, row(5.0), bw, 44.0), "Cancel") {
+            self.editor = None;
+            return;
+        }
+        if let Some(ed) = &mut self.editor {
+            if let Some(b) = pick {
+                ed.brush = b;
+            }
+            if let Some(e) = ed.err.clone() {
+                for (i, chunk) in e.as_bytes().chunks(40).enumerate() {
+                    self.text(&String::from_utf8_lossy(chunk), x0 + 30.0, row(6.0) + 10.0 + i as f32 * 16.0, 13.0, Color::new(1.0, 0.45, 0.4, 1.0), false);
+                }
+            }
+        }
+    }
+
     // ---------------- drawing ----------------
 
     fn draw_piece(&self, p: Piece, c: Vec2, scale: f32, alpha: f32) {
@@ -765,13 +950,19 @@ impl App {
         let x = c.x - d.width / 2.0;
         let y = c.y + d.offset_y - d.height / 2.0;
         draw_ellipse(c.x, c.y + size * 0.4, size * 0.3 * scale, size * 0.07, 0.0, Color::new(0.0, 0.0, 0.0, 0.22 * alpha));
-        let (fill, line) = if p.color.is_white() {
-            (Color::new(0.99, 0.97, 0.92, alpha), Color::new(0.1, 0.08, 0.08, alpha))
-        } else {
-            (Color::new(0.13, 0.13, 0.16, alpha), Color::new(0.92, 0.9, 0.86, 0.75 * alpha))
-        };
+        let (fill, line, glow) = skins::piece_colors(self.skin, p.color.is_white());
+        let (fill, line) = (with_a(fill, fill.a * alpha), with_a(line, line.a * alpha));
         let o = size * 0.028;
         let tp = |col| TextParams { font: Some(&self.font), font_size: fs, font_scale: fsc, color: col, ..Default::default() };
+        if let Some(g) = glow {
+            let pulse = 0.8 + 0.2 * (get_time() as f32 * 3.0).sin();
+            for ring in [4.0, 2.5] {
+                for i in 0..8 {
+                    let a = i as f32 * PI / 4.0;
+                    draw_text_ex(ch, x + a.cos() * o * ring, y + a.sin() * o * ring, tp(with_a(g, 0.12 * alpha * pulse)));
+                }
+            }
+        }
         for i in 0..8 {
             let a = i as f32 * PI / 4.0;
             draw_text_ex(ch, x + a.cos() * o, y + a.sin() * o, tp(line));
@@ -796,13 +987,9 @@ impl App {
         if self.overlay.is_none() {
             draw_rectangle(-10.0, -2.0, BOARD + 26.0, BOARD + 26.0, Color::new(0.0, 0.0, 0.0, 0.35));
         }
-        draw_rectangle(-16.0, -16.0, BOARD + 32.0, BOARD + 32.0, with_a(Color::from_rgba(58, 40, 30, 255), ba));
+        skins::draw_base(self.skin, self.skin_tex.as_ref(), ba, time);
         for i in 0..64u32 {
-            let sq = Square::new(i);
-            let c = self.sq_pos(sq);
-            let light = (sq.file().to_u32() + sq.rank().to_u32()) % 2 == 1;
-            let col = if light { Color::from_rgba(238, 218, 186, 255) } else { Color::from_rgba(180, 135, 99, 255) };
-            draw_rectangle(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, with_a(col, ba));
+            let c = self.sq_pos(Square::new(i));
             let h = self.hover_amt[i as usize];
             if h > 0.01 {
                 draw_rectangle(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, Color::new(1.0, 1.0, 1.0, 0.18 * h));
@@ -827,11 +1014,17 @@ impl App {
                 }
             }
         }
-        // coordinates
+        if let Some(g) = &self.grass {
+            g.draw(ba);
+        }
+        self.draw_coords();
+    }
+
+    fn draw_coords(&self) {
         for i in 0..8u32 {
             let f = Square::from_coords(File::new(i), if self.player == Side::White { Rank::First } else { Rank::Eighth });
             let r = Square::from_coords(if self.player == Side::White { File::A } else { File::H }, Rank::new(i));
-            let col = Color::new(0.3, 0.2, 0.15, 0.7);
+            let col = skins::coord_color(self.skin);
             let c = self.sq_pos(f);
             self.text(&f.file().char().to_string(), c.x + SQ * 0.32, c.y + SQ * 0.45, 13.0, col, true);
             let c = self.sq_pos(r);
@@ -840,6 +1033,10 @@ impl App {
     }
 
     fn draw_world(&self, wm: Vec2) {
+        if self.editor.is_some() {
+            self.draw_editor_world(wm);
+            return;
+        }
         self.draw_board();
         let moving: Vec<Square> = self.anim.iter().flat_map(|a| a.slides.iter().map(|s| s.dest)).collect();
         for (sq, p) in self.pos.board().iter() {
@@ -965,14 +1162,14 @@ impl App {
         draw_rectangle(x0, 0.0, PANEL, sh, Color::from_rgba(28, 28, 36, 255));
         draw_rectangle(x0, 0.0, 2.0, sh, Color::from_rgba(50, 50, 64, 255));
 
-        let e = self.elo_disp.clamp(1.0, MAGNUS);
+        let e = self.elo_disp.clamp(1.0, MAX_ELO);
         let col = elo_color(e);
-        let magnus = self.tier == TIERS.len() - 1;
+        let magnus = self.tier >= MAGNUS_TIER;
         let d = self.text("OPPONENT", x0 + 30.0, 44.0, 16.0, GRAY, true);
         let mood = format!("{:?}", self.mood).to_uppercase();
         self.text(&format!("·  {mood}"), x0 + 40.0 + d.width, 44.0, 16.0, mood_color(self.mood), true);
         let pop = 1.0 + 0.35 * ease_out_back(self.tier_pop) * self.tier_pop + 0.06 * self.tick_pop;
-        let num_col = if magnus { Color::new(1.0, 0.8 + 0.15 * (time * 6.0).sin(), 0.25, 1.0) } else { col };
+        let num_col = if self.tier == MAGNUS_TIER { Color::new(1.0, 0.8 + 0.15 * (time * 6.0).sin(), 0.25, 1.0) } else { col };
         let d = self.text(&format!("{:.0}", e), x0 + 30.0, 108.0, 60.0 * pop, num_col, true);
         self.text("ELO", x0 + 40.0 + d.width, 108.0, 18.0, GRAY, true);
         self.text(TIERS[self.tier].1, x0 + 30.0, 145.0, 24.0 * (1.0 + 0.2 * self.tier_pop), col, true);
@@ -994,20 +1191,26 @@ impl App {
             if y1 <= ky {
                 break;
             }
-            let c = elo_color(1.0 + (MAGNUS - 1.0) * i as f32 / n as f32);
+            let c = elo_color(1.0 + (MAX_ELO - 1.0) * i as f32 / n as f32);
             let shim = 0.18 * ((time * 3.0 + y0 * 0.04).sin()).max(0.0).powi(4);
             let c = Color::new((c.r + shim).min(1.0), (c.g + shim).min(1.0), (c.b + shim).min(1.0), 1.0);
             draw_rectangle(b.x, y0.max(ky), b.w, y1 - y0.max(ky), c);
         }
         // tier ladder
+        let mut label_y = f32::MAX;
         for (i, t) in TIERS.iter().enumerate().skip(1) {
-            let y = b.y + b.h * (1.0 - (t.0 - 1.0) / (MAGNUS - 1.0));
+            let y = b.y + b.h * (1.0 - (t.0 - 1.0) / (MAX_ELO - 1.0));
             let reached = e >= t.0;
             let c = if reached { elo_color(t.0) } else { Color::from_rgba(90, 90, 105, 255) };
             draw_line(b.x + b.w + 6.0, y, b.x + b.w + 18.0, y, 2.0, c);
+            // keep labels from overlapping where tiers are close together
+            label_y = y.min(label_y - 17.0);
+            if label_y != y {
+                draw_line(b.x + b.w + 18.0, y, b.x + b.w + 24.0, label_y, 1.0, with_a(c, 0.5));
+            }
             let wob = if i == self.tier { 4.0 * self.tier_pop } else { 0.0 };
-            self.text(t.1, b.x + b.w + 26.0 + wob, y + 5.0, if i == self.tier { 17.0 } else { 14.0 }, c, i == self.tier);
-            self.text(&format!("{:.0}", t.0), b.x + b.w + 212.0, y + 5.0, 12.0, with_a(c, 0.6), false);
+            self.text(t.1, b.x + b.w + 26.0 + wob, label_y + 5.0, if i == self.tier { 16.0 } else { 13.0 }, c, i == self.tier);
+            self.text(&format!("{:.0}", t.0), b.x + b.w + 212.0, label_y + 5.0, 12.0, with_a(c, 0.6), false);
         }
         // crown
         let crown = vec2(b.x + r, b.y - 42.0);
@@ -1016,7 +1219,7 @@ impl App {
                 draw_circle(crown.x, crown.y, 34.0 * (1.0 - i as f32 / 7.0) * (0.9 + 0.1 * (time * 5.0).sin()), Color::new(1.0, 0.8, 0.2, 0.08));
             }
         }
-        let cc = if magnus { GOLD } else { Color::from_rgba(80, 80, 95, 255) };
+        let cc = if self.tier == MAGNUS_TIER { GOLD } else if magnus { col } else { Color::from_rgba(80, 80, 95, 255) };
         self.draw_crown(crown, 1.0 + 0.25 * self.tier_pop * magnus as u8 as f32, cc);
 
         // knob: squash/stretch with velocity, pops on every 100 and harder on tier change
@@ -1039,9 +1242,12 @@ impl App {
             self.opening = (self.opening + 1) % OPENINGS.len();
             self.new_game(self.player);
         }
-        if self.button(Rect::new(x0 + 30.0, by - 54.0, bw, 44.0), &format!("Clock: {}  (new game)", TCS[self.tc].0)) {
+        if self.button(Rect::new(x0 + 30.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("Clock: {}", TCS[self.tc].0)) {
             self.tc = (self.tc + 1) % TCS.len();
             self.new_game(self.player);
+        }
+        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("Skin: {}", skins::SKINS[self.skin])) {
+            self.set_skin(self.skin + 1);
         }
         if self.button(Rect::new(x0 + 30.0, by, bw / 2.0 - 5.0, 44.0), "Play White") {
             self.new_game(Side::White);
@@ -1049,11 +1255,15 @@ impl App {
         if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by, bw / 2.0 - 5.0, 44.0), "Play Black") {
             self.new_game(Side::Black);
         }
-        if self.button(Rect::new(x0 + 30.0, by + 54.0, bw / 2.0 - 5.0, 44.0), "Undo") {
+        let third = (bw - 10.0) / 3.0;
+        if self.button(Rect::new(x0 + 30.0, by + 54.0, third, 44.0), "Undo") {
             self.undo();
         }
-        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by + 54.0, bw / 2.0 - 5.0, 44.0), "Overlay") {
+        if self.button(Rect::new(x0 + 35.0 + third, by + 54.0, third, 44.0), "Overlay") {
             self.relaunch(true);
+        }
+        if self.button(Rect::new(x0 + 40.0 + 2.0 * third, by + 54.0, third, 44.0), "Position") {
+            self.editor = Some(Editor { board: self.pos.board().clone(), turn: self.pos.turn(), brush: Some(Piece { color: Side::White, role: Role::Queen }), err: None });
         }
         let status = if self.over() {
             match self.winner() {
@@ -1110,24 +1320,24 @@ impl App {
     }
 
     /// Overlay mode's compact controls: grip | - ELO + | status | undo | new | exit.
+    /// Overlay controls, two rows: [grip  -  ELO  +   status] / [Undo  New  Skin  Exit].
     fn draw_strip(&mut self) {
         let (sw, sh) = (screen_width(), screen_height());
         let y = sh - STRIP;
         draw_rectangle(0.0, y, sw, STRIP, Color::new(0.11, 0.11, 0.14, 0.85));
         for i in 0..6 {
-            draw_circle(14.0 + (i % 2) as f32 * 8.0, y + 16.0 + (i / 2) as f32 * 9.0, 2.2, GRAY); // grip
+            draw_circle(16.0 + (i % 2) as f32 * 8.0, y + 14.0 + (i / 2) as f32 * 9.0, 2.2, GRAY); // grip
         }
-        let e = self.elo_disp.clamp(1.0, MAGNUS);
-        let b = |x: f32, w: f32| Rect::new(x, y + 10.0, w, STRIP - 20.0);
-        if self.button(b(40.0, 30.0), "-") {
+        let e = self.elo_disp.clamp(1.0, MAX_ELO);
+        let r1 = |x: f32, w: f32| Rect::new(x, y + 8.0, w, 34.0);
+        if self.button(r1(52.0, 40.0), "-") {
             self.elo = (self.elo - 100.0).max(1.0);
         }
         let pop = 1.0 + 0.3 * self.tier_pop + 0.06 * self.tick_pop;
-        self.text_c(&format!("{:.0}", e), vec2(105.0, y + 22.0), 24.0 * pop, elo_color(e), true);
-        let short = TIERS[self.tier].1.split(' ').next().unwrap_or_default();
-        self.text_c(short, vec2(105.0, y + 43.0), 10.0, elo_color(e), true);
-        if self.button(b(140.0, 30.0), "+") {
-            self.elo = (self.elo + 100.0).min(MAGNUS);
+        self.text_c(&format!("{:.0}", e), vec2(150.0, y + 18.0), 24.0 * pop, elo_color(e), true);
+        self.text_c(TIERS[self.tier].1, vec2(150.0, y + 38.0), 11.0, elo_color(e), true);
+        if self.button(r1(208.0, 40.0), "+") {
+            self.elo = (self.elo + 100.0).min(MAX_ELO);
         }
         let status = if self.over() {
             "Game over".to_string()
@@ -1138,15 +1348,21 @@ impl App {
         } else {
             "Thinking…".to_string()
         };
-        self.text(&status, 182.0, y + 34.0, 14.0, LIGHTGRAY, true);
-        if self.button(b(sw - 178.0, 56.0), "Undo") {
-            self.undo();
-        }
-        if self.button(b(sw - 116.0, 50.0), "New") {
-            self.new_game(self.player);
-        }
-        if self.button(b(sw - 60.0, 50.0), "Exit") {
-            self.relaunch(false);
+        self.text_c(&status, vec2((268.0 + sw) / 2.0, y + 26.0), 16.0, LIGHTGRAY, true);
+        let labels = ["Undo", "New", "Skin", "Exit"];
+        let gap = 14.0;
+        let w = (sw - 2.0 * gap - gap * (labels.len() - 1) as f32) / labels.len() as f32;
+        for (i, label) in labels.into_iter().enumerate() {
+            let r = Rect::new(gap + i as f32 * (w + gap), y + 52.0, w, 38.0);
+            let text = if label == "Skin" { format!("Skin: {}", skins::SKINS[self.skin]) } else { label.to_string() };
+            if self.button(r, &text) {
+                match label {
+                    "Undo" => self.undo(),
+                    "New" => self.new_game(self.player),
+                    "Skin" => self.set_skin(self.skin + 1),
+                    _ => self.relaunch(false),
+                }
+            }
         }
         self.draw_particles(true);
     }
@@ -1197,9 +1413,12 @@ impl App {
         self.draw_game_over();
         if self.overlay.is_some() {
             self.draw_strip();
+        } else if self.editor.is_some() {
+            self.draw_editor_panel();
         } else {
             self.draw_panel();
         }
+        self.save_settings();
     }
 }
 
@@ -1208,6 +1427,23 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("explorer").arg(url).spawn();
     #[cfg(not(windows))]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+fn settings_path() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config")))
+    };
+    Some(base?.join("funchess").join("settings"))
+}
+
+/// Saved value for `key`, unless given on the command line.
+fn setting(key: &str) -> Option<String> {
+    arg(&format!("--{key}")).or_else(|| {
+        let text = std::fs::read_to_string(settings_path()?).ok()?;
+        text.lines().find_map(|l| l.strip_prefix(&format!("{key}=")).map(str::to_string))
+    })
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -1221,10 +1457,16 @@ fn overlay_mode() -> bool {
 
 fn conf() -> Conf {
     let mut c = Conf { window_title: "Fun Chess".into(), window_width: 1280, window_height: 820, sample_count: 4, ..Default::default() };
+    c.icon = Some(miniquad::conf::Icon {
+        small: *include_bytes!("../assets/icon16.rgba"),
+        medium: *include_bytes!("../assets/icon32.rgba"),
+        big: *include_bytes!("../assets/icon64.rgba"),
+    });
+    c.platform.linux_wm_class = "funchess"; // matches StartupWMClass in the .desktop launcher
     if overlay_mode() {
         c.window_title = overlay::TITLE.into();
-        c.window_width = 520;
-        c.window_height = 560;
+        c.window_width = 560;
+        c.window_height = 650;
         c.window_resizable = false;
         c.platform.framebuffer_alpha = true;
         c.platform.linux_wm_class = overlay::WM_CLASS;
@@ -1249,14 +1491,14 @@ async fn main() {
         .and_then(|f| f.parse::<shakmaty::fen::Fen>().ok()?.into_position(shakmaty::CastlingMode::Standard).ok())
         .unwrap_or_default();
     let player = if arg("--side").as_deref() == Some("b") { Side::Black } else { Side::White };
-    let tc = arg("--tc").and_then(|t| t.parse().ok()).filter(|&t: &usize| t < TCS.len()).unwrap_or(0);
+    let tc = setting("tc").and_then(|t| t.parse().ok()).filter(|&t: &usize| t < TCS.len()).unwrap_or(0);
     let clock = arg("--clock")
         .and_then(|c| {
             let (b, w) = c.split_once(',')?;
             Some([b.parse().ok()?, w.parse().ok()?])
         })
         .unwrap_or([TCS[tc].1; 2]);
-    let elo = arg("--elo").and_then(|e| e.parse().ok()).unwrap_or(1200.0f32).clamp(1.0, MAGNUS);
+    let elo = setting("elo").and_then(|e| e.parse().ok()).unwrap_or(1200.0f32).clamp(1.0, MAX_ELO);
     let mut app = App {
         pos,
         history: vec![],
@@ -1289,6 +1531,11 @@ async fn main() {
         pending: None,
         over_t: 0.0,
         engine,
+        skin: 0,
+        skin_tex: None,
+        grass: None,
+        editor: None,
+        saved: (0.0, usize::MAX, 0),
         played: vec![],
         opening: arg("--opening").and_then(|o| o.parse().ok()).filter(|&o: &usize| o < OPENINGS.len()).unwrap_or(0),
         opening_name: None,
@@ -1305,6 +1552,8 @@ async fn main() {
         font,
         bold,
     };
+    app.set_skin(setting("skin").and_then(|s| s.parse().ok()).unwrap_or(0));
+    app.saved = (app.elo.round(), app.skin, app.tc);
     loop {
         app.update();
         app.draw();
