@@ -13,8 +13,9 @@ defensive when you go for its king, has lapses (yes, Magnus too) and hurries on 
   opening name is shown as you play.
 - Your moves are graded instantly: Brilliant !!, Great !, Best, Excellent, Good, Inaccuracy ?!, Mistake ?, Blunder ??
 - Clocks: none, 1+0, 3+2, 5+0, 10+0
-- Skins: Classic, Wood, Steel, Neon, and Grass (every blade is simulated: it sways in the wind,
-  bends away from your cursor and moving pieces, and gets blown flat by captures)
+- Skins: Classic, Wood, Steel, Neon and Grass, with real 3D-rendered Staunton pieces and boards.
+  In Grass every blade is simulated: gusts roll across the field, blades part around pieces,
+  bend away from your cursor and moving pieces, get trampled, and are blown flat by captures
 - From position: set up any position (or paste a FEN) and play it out against any bot
 - Beyond Magnus: "Beyond Magnus", "Peak Human" and "Theoretical Human" keep the same human style;
   mistake rates follow the trend fitted on real 1800-2500+ games, then fade to zero at 3500
@@ -36,7 +37,8 @@ Grab the zip for your OS from Releases, unzip, run `funchess` / `funchess.exe`
 
 Controls: wheel = zoom (scroll over the panel = ELO), right-drag = pan, R = reset view.
 
-Game statistics come from the Lichess open database (CC0); opening names from
+Pieces and boards: Staunton Pieces by James Clarke (MIT); grade icons: Google Material Symbols
+(Apache 2.0); see assets/CREDITS.md. Game statistics come from the Lichess open database (CC0); opening names from
 lichess-org/chess-openings (CC0, in data/openings). Stockfish is GPLv3 and is distributed unmodified alongside this program; see the bundled
 Stockfish-COPYING.txt / Stockfish-SOURCE.txt. `vendor/miniquad` is miniquad 0.4.11 (MIT/Apache)
 with a small patch so transparent windows get a 32-bit visual on X11.

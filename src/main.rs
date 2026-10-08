@@ -55,6 +55,23 @@ fn tier(e: f32) -> usize {
     TIERS.iter().rposition(|t| e >= t.0).unwrap_or(0)
 }
 
+/// Position along the ELO bar (0..1); every tier gets an equal slice, so close-together
+/// tiers (like the ones past Magnus) don't crowd.
+fn elo_frac(e: f32) -> f32 {
+    let i = tier(e);
+    let a = TIERS[i].0.max(1.0);
+    let b = TIERS.get(i + 1).map_or(MAX_ELO, |t| t.0);
+    (i as f32 + ((e - a) / (b - a)).clamp(0.0, 1.0)) / TIERS.len() as f32
+}
+
+fn frac_elo(f: f32) -> f32 {
+    let x = f.clamp(0.0, 1.0) * TIERS.len() as f32;
+    let i = (x as usize).min(TIERS.len() - 1);
+    let a = TIERS[i].0.max(1.0);
+    let b = TIERS.get(i + 1).map_or(MAX_ELO, |t| t.0);
+    a + (b - a) * (x - i as f32)
+}
+
 fn elo_color(e: f32) -> Color {
     let i = tier(e);
     let (a, ca) = (TIERS[i].0, TIERS[i].2);
@@ -180,6 +197,8 @@ struct App {
     engine: ai::Engine,
     skin: usize,
     skin_tex: Option<Texture2D>,
+    piece_tex: Vec<Texture2D>,
+    icons: Vec<Texture2D>,
     grass: Option<skins::Grass>,
     editor: Option<Editor>,
     saved: (f32, usize, usize),
@@ -260,7 +279,8 @@ impl App {
 
     fn set_skin(&mut self, skin: usize) {
         self.skin = skin % skins::SKINS.len();
-        self.skin_tex = skins::texture(self.skin);
+        self.skin_tex = skins::board(self.skin);
+        self.piece_tex = skins::pieces(self.skin);
         self.grass = (self.skin == skins::GRASS).then(skins::Grass::new);
     }
 
@@ -426,7 +446,8 @@ impl App {
 
     fn knob_y(&self) -> f32 {
         let b = self.bar_rect();
-        let f = ((self.elo_disp - 1.0) / (MAX_ELO - 1.0)).clamp(-0.03, 1.03);
+        let e = self.elo_disp.clamp(1.0, MAX_ELO);
+        let f = (elo_frac(e) + (self.elo_disp - e) / 2000.0).clamp(-0.03, 1.03);
         b.y + b.h * (1.0 - f)
     }
 
@@ -524,7 +545,7 @@ impl App {
             self.burst(at, col, 30, 260.0, false);
             self.burst(at, ORANGE, 10, 180.0, false);
             if let Some(g) = &mut self.grass {
-                g.blast(at, 1.0);
+                g.blast(at + vec2(0.0, SQ * 0.3), 1.0);
             }
             self.shake += 7.0;
             self.punch += 0.035;
@@ -568,7 +589,7 @@ impl App {
             self.elo_drag = false;
         }
         if self.elo_drag {
-            self.elo = ((bar.y + bar.h - mouse.y) / bar.h).clamp(0.0, 1.0) * (MAX_ELO - 1.0) + 1.0;
+            self.elo = frac_elo((bar.y + bar.h - mouse.y) / bar.h);
         }
         if wheel != 0.0 && !on_board_side {
             self.elo = (self.elo + wheel.signum() * 25.0).clamp(1.0, MAX_ELO);
@@ -628,7 +649,7 @@ impl App {
         self.punch *= (-dt * 7.0).exp();
 
         // --- grass: cursor, dragged and sliding pieces brush through it ---
-        if let Some(g) = &mut self.grass {
+        if self.grass.is_some() {
             let mut pushers = vec![];
             if on_board_side {
                 pushers.push((wm, 30.0));
@@ -640,7 +661,15 @@ impl App {
                 let e = 1.0 - (1.0 - a.t.clamp(0.0, 1.0)).powi(3);
                 pushers.extend(a.slides.iter().map(|s| (s.from.lerp(s.to, e), 46.0)));
             }
-            g.update(dt, get_time() as f32, &pushers);
+            let moving: Vec<Square> = self.anim.iter().flat_map(|a| a.slides.iter().map(|s| s.dest)).collect();
+            let resting: Vec<Vec2> = self
+                .pos
+                .board()
+                .iter()
+                .filter(|(sq, _)| !moving.contains(sq))
+                .map(|(sq, _)| self.sq_pos(sq) + vec2(0.0, SQ * 0.36))
+                .collect();
+            self.grass.as_mut().unwrap().update(dt, get_time() as f32, &pushers, &resting);
         }
 
         // --- animations / fx ---
@@ -842,7 +871,7 @@ impl App {
         let ed = self.editor.as_ref().unwrap();
         skins::draw_base(self.skin, self.skin_tex.as_ref(), 1.0, get_time() as f32);
         if let Some(g) = &self.grass {
-            g.draw(1.0);
+            g.draw(0, g.len(), 1.0);
         }
         self.draw_coords();
         for (sq, p) in ed.board.iter() {
@@ -934,40 +963,21 @@ impl App {
     // ---------------- drawing ----------------
 
     fn draw_piece(&self, p: Piece, c: Vec2, scale: f32, alpha: f32) {
-        let ch = match p.role {
-            Role::King => "♚",
-            Role::Queen => "♛",
-            Role::Rook => "♜",
-            Role::Bishop => "♝",
-            Role::Knight => "♞",
-            Role::Pawn => "♟",
-        };
         let alpha = alpha * self.board_alpha();
-        let size = SQ * 0.84 * scale;
-        let fs = 128u16;
-        let fsc = size / fs as f32;
-        let d = measure_text(ch, Some(&self.font), fs, fsc);
-        let x = c.x - d.width / 2.0;
-        let y = c.y + d.offset_y - d.height / 2.0;
-        draw_ellipse(c.x, c.y + size * 0.4, size * 0.3 * scale, size * 0.07, 0.0, Color::new(0.0, 0.0, 0.0, 0.22 * alpha));
-        let (fill, line, glow) = skins::piece_colors(self.skin, p.color.is_white());
-        let (fill, line) = (with_a(fill, fill.a * alpha), with_a(line, line.a * alpha));
-        let o = size * 0.028;
-        let tp = |col| TextParams { font: Some(&self.font), font_size: fs, font_scale: fsc, color: col, ..Default::default() };
-        if let Some(g) = glow {
+        let tex = &self.piece_tex[skins::piece_index(p.color.is_white(), p.role)];
+        let w = SQ * 1.04 * scale;
+        let h = w * tex.height() / tex.width();
+        // in the renders the piece's base is at 90% of the image height, centred a touch left
+        let foot = c.y + SQ * 0.36 * scale;
+        let (left, top) = (c.x - w * 0.54, foot - h * 0.9);
+        let dest = |w: f32, h: f32| DrawTextureParams { dest_size: Some(vec2(w, h)), ..Default::default() };
+        if let Some(g) = skins::glow(self.skin, p.color.is_white()) {
             let pulse = 0.8 + 0.2 * (get_time() as f32 * 3.0).sin();
-            for ring in [4.0, 2.5] {
-                for i in 0..8 {
-                    let a = i as f32 * PI / 4.0;
-                    draw_text_ex(ch, x + a.cos() * o * ring, y + a.sin() * o * ring, tp(with_a(g, 0.12 * alpha * pulse)));
-                }
+            for grow in [14.0, 7.0] {
+                draw_texture_ex(tex, left - grow / 2.0, top - grow / 2.0, with_a(g, 0.28 * alpha * pulse), dest(w + grow, h + grow));
             }
         }
-        for i in 0..8 {
-            let a = i as f32 * PI / 4.0;
-            draw_text_ex(ch, x + a.cos() * o, y + a.sin() * o, tp(line));
-        }
-        draw_text_ex(ch, x, y, tp(fill));
+        draw_texture_ex(tex, left, top, with_a(WHITE, alpha), dest(w, h));
     }
 
     fn text(&self, s: &str, x: f32, y: f32, size: f32, col: Color, bold: bool) -> TextDimensions {
@@ -1014,9 +1024,6 @@ impl App {
                 }
             }
         }
-        if let Some(g) = &self.grass {
-            g.draw(ba);
-        }
         self.draw_coords();
     }
 
@@ -1039,14 +1046,29 @@ impl App {
         }
         self.draw_board();
         let moving: Vec<Square> = self.anim.iter().flat_map(|a| a.slides.iter().map(|s| s.dest)).collect();
-        for (sq, p) in self.pos.board().iter() {
-            if moving.contains(&sq) {
-                continue;
-            }
+        // back to front: the renders are taller than a square and overlap the one behind
+        let mut pieces: Vec<(Square, Piece)> = self.pos.board().iter().filter(|(sq, _)| !moving.contains(sq)).collect();
+        pieces.sort_by(|a, b| self.sq_pos(a.0).y.total_cmp(&self.sq_pos(b.0).y));
+        let mut drawn = 0; // grass blades drawn so far: pieces stand *in* the grass
+        let ba = self.board_alpha();
+        for (sq, p) in pieces {
             let dragged = self.dragging && self.sel == Some(sq);
             let h = self.hover_amt[sq as usize];
             let c = self.sq_pos(sq) - vec2(0.0, 4.0 * h);
+            if let Some(g) = &self.grass {
+                let upto = g.split(self.sq_pos(sq).y + SQ * 0.3);
+                g.draw(drawn, upto.max(drawn), ba);
+                drawn = upto.max(drawn);
+            }
             self.draw_piece(p, c, 1.0 + 0.07 * h, if dragged { 0.3 } else { 1.0 });
+        }
+        if let Some(g) = &self.grass {
+            g.draw(drawn, g.len(), ba);
+            // keep last move / selection readable through the blades
+            for s in self.last.iter().flat_map(|(a, b)| [*a, *b]).chain(self.sel) {
+                let c = self.sq_pos(s);
+                draw_rectangle_lines(c.x - SQ / 2.0 + 2.0, c.y - SQ / 2.0 + 2.0, SQ - 4.0, SQ - 4.0, 3.0, Color::new(1.0, 0.9, 0.3, 0.7));
+            }
         }
         // legal move dots, popping in staggered by distance
         if let Some(s) = self.sel.filter(|_| self.anim.is_none()) {
@@ -1127,7 +1149,19 @@ impl App {
         draw_circle(p.x, p.y, r + 2.0, WHITE);
         draw_circle(p.x, p.y, r, col);
         if pop > 0.05 {
-            self.text_c(g.label().0, p, 17.0 * pop, WHITE, true);
+            let i = match g {
+                Grade::Brilliant => 0,
+                Grade::Great => 1,
+                Grade::Book => 2,
+                Grade::Best => 3,
+                Grade::Excellent => 4,
+                Grade::Good => 5,
+                Grade::Inaccuracy => 6,
+                Grade::Mistake => 7,
+                Grade::Blunder => 8,
+            };
+            let s = r * 1.45;
+            draw_texture_ex(&self.icons[i], p.x - s / 2.0, p.y - s / 2.0, WHITE, DrawTextureParams { dest_size: Some(vec2(s, s)), ..Default::default() });
         }
     }
 
@@ -1191,7 +1225,7 @@ impl App {
             if y1 <= ky {
                 break;
             }
-            let c = elo_color(1.0 + (MAX_ELO - 1.0) * i as f32 / n as f32);
+            let c = elo_color(frac_elo(i as f32 / n as f32));
             let shim = 0.18 * ((time * 3.0 + y0 * 0.04).sin()).max(0.0).powi(4);
             let c = Color::new((c.r + shim).min(1.0), (c.g + shim).min(1.0), (c.b + shim).min(1.0), 1.0);
             draw_rectangle(b.x, y0.max(ky), b.w, y1 - y0.max(ky), c);
@@ -1199,7 +1233,7 @@ impl App {
         // tier ladder
         let mut label_y = f32::MAX;
         for (i, t) in TIERS.iter().enumerate().skip(1) {
-            let y = b.y + b.h * (1.0 - (t.0 - 1.0) / (MAX_ELO - 1.0));
+            let y = b.y + b.h * (1.0 - elo_frac(t.0));
             let reached = e >= t.0;
             let c = if reached { elo_color(t.0) } else { Color::from_rgba(90, 90, 105, 255) };
             draw_line(b.x + b.w + 6.0, y, b.x + b.w + 18.0, y, 2.0, c);
@@ -1533,6 +1567,21 @@ async fn main() {
         engine,
         skin: 0,
         skin_tex: None,
+        piece_tex: vec![],
+        icons: [
+            include_bytes!("../assets/grades/diamond.png").as_slice(),
+            include_bytes!("../assets/grades/priority_high.png"),
+            include_bytes!("../assets/grades/menu_book.png"),
+            include_bytes!("../assets/grades/star.png"),
+            include_bytes!("../assets/grades/thumb_up.png"),
+            include_bytes!("../assets/grades/check.png"),
+            include_bytes!("../assets/grades/trending_down.png"),
+            include_bytes!("../assets/grades/question_mark.png"),
+            include_bytes!("../assets/grades/dangerous.png"),
+        ]
+        .iter()
+        .map(|b| skins::load(b))
+        .collect(),
         grass: None,
         editor: None,
         saved: (0.0, usize::MAX, 0),
