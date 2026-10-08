@@ -24,6 +24,8 @@ cp dist/dl/win/stockfish/stockfish-windows-x86-64-universal.exe dist/funchess-wi
 for d in dist/funchess-linux dist/funchess-windows; do
   cp dist/dl/stockfish/Copying.txt "$d/Stockfish-COPYING.txt"
   echo "Stockfish $SF (GPLv3), source: https://github.com/official-stockfish/Stockfish/tree/$SF" > "$d/Stockfish-SOURCE.txt"
+  cp assets/CREDITS.md "$d/CREDITS.md"
+  cp assets/STAUNTON-LICENSE.txt "$d/STAUNTON-LICENSE.txt"
 done
 # llvm-mingw's C++ runtime, if the exe links it dynamically
 for dll in libunwind.dll libc++.dll; do
