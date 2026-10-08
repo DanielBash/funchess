@@ -33,8 +33,14 @@ macro_rules! piece_set {
     };
 }
 
-/// 12 piece textures for a skin, white K Q R B N P then black.
-pub fn pieces(skin: usize) -> Vec<Texture2D> {
+/// A piece render plus the box its visible pixels occupy (renders have uneven padding).
+pub struct Sprite {
+    pub tex: Texture2D,
+    pub bbox: Rect,
+}
+
+/// 12 piece sprites for a skin, white K Q R B N P then black.
+pub fn pieces(skin: usize) -> Vec<Sprite> {
     let set: [&[u8]; 12] = match skin {
         WOOD => piece_set!("wood"),
         STEEL => piece_set!("metal"),
@@ -42,7 +48,23 @@ pub fn pieces(skin: usize) -> Vec<Texture2D> {
         GRASS => piece_set!("modernwood"),
         _ => piece_set!("basic"),
     };
-    set.iter().map(|b| load(b)).collect()
+    set.iter()
+        .map(|b| {
+            let img = Image::from_file_with_format(b, None).unwrap();
+            let (w, h) = (img.width as u32, img.height as u32);
+            let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+            for y in 0..h {
+                for x in 0..w {
+                    if img.get_pixel(x, y).a > 0.15 {
+                        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                    }
+                }
+            }
+            let tex = Texture2D::from_image(&img);
+            tex.set_filter(FilterMode::Linear);
+            Sprite { tex, bbox: Rect::new(x0 as f32, y0 as f32, (x1 - x0 + 1) as f32, (y1 - y0 + 1) as f32) }
+        })
+        .collect()
 }
 
 pub fn piece_index(white: bool, role: shakmaty::Role) -> usize {

@@ -2,6 +2,7 @@
 // the chosen ELO would actually play. Low ELO = big noise + loves checks/captures/king hunts.
 // The same process also grades the player's moves (analysis runs while they think).
 use crate::book;
+use crate::i18n::{ru, tr};
 use macroquad::rand::gen_range;
 use shakmaty::{fen::Fen, uci::UciMove, Chess, EnPassantMode, Move, Position, Role, Square};
 use std::io::{BufRead, BufReader, Write};
@@ -79,7 +80,7 @@ pub fn spawn() -> Result<Engine, String> {
                     match replay {
                         Some((mv, info)) => {
                             channel = real.map(|g| (game_id, g));
-                            let tag = Some(format!("Real game move! ({})", info.1));
+                            let tag = Some(format!("{} ({})", tr("Real game move!", "Ход из реальной партии!"), info.1));
                             Reply::Move { game_id, mv: Some(mv), tag, mood: Mood::Calm, real: Some(info) }
                         }
                         None => {
@@ -172,7 +173,13 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
             let sum: f32 = options.iter().map(|o| o.1).sum();
             let mut r = gen_range(0.0, sum);
             if let Some(&(mv, _, s)) = options.iter().find(|o| r < o.1 || { r -= o.1; false }) {
-                let tag = (s >= 0.6).then(|| format!("Scores {:.0}% vs {} players", s * 100.0, book::band_label(band)));
+                let tag = (s >= 0.6).then(|| {
+                    if ru() {
+                        format!("Набирает {:.0}% против игроков {}", s * 100.0, book::band_label(band).replace("under-800", "до 800"))
+                    } else {
+                        format!("Scores {:.0}% vs {} players", s * 100.0, book::band_label(band))
+                    }
+                });
                 return (Some(mv), tag, Mood::Calm);
             }
         }
@@ -254,12 +261,12 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
         }
     }
     let tag = match (target, pick.2 >= 40.0) {
-        (4, true) => Some("Spicy sac?!"),
-        (4, false) => Some("Blunder??"),
-        (3, true) => Some("Speculative!?"),
-        (3, false) => Some("Mistake?"),
+        (4, true) => Some(tr("Spicy sac?!", "Острая жертва?!")),
+        (4, false) => Some(tr("Blunder??", "Зевок??")),
+        (3, true) => Some(tr("Speculative!?", "Рискованно!?")),
+        (3, false) => Some(tr("Mistake?", "Ошибка?")),
         _ if pick.3.is_some() => pick.3,
-        _ if pick.0 != best_mv && pick.2 >= 40.0 => Some("Cheeky!"),
+        _ if pick.0 != best_mv && pick.2 >= 40.0 => Some(tr("Cheeky!", "Нахально!")),
         _ => None,
     };
     (Some(pick.0), tag.map(str::to_string), mood)
@@ -380,8 +387,8 @@ fn react(pos: &Chess, m: Move) -> (f32, Option<&'static str>) {
     let saved = hanging(pos.board(), us) - hanging(after.board(), us);
     let punished = if m.capture().is_some() && en_prise(pos.board(), m.to(), !us) { m.capture().map_or(0.0, value) } else { 0.0 };
     match (saved > 0.0, punished > 0.0) {
-        (_, true) => (0.5 * punished + 0.4 * saved.max(0.0), Some("Punishes!")),
-        (true, _) => (0.5 * saved, Some("Defends!")),
+        (_, true) => (0.5 * punished + 0.4 * saved.max(0.0), Some(tr("Punishes!", "Наказывает!"))),
+        (true, _) => (0.5 * saved, Some(tr("Defends!", "Защищается!"))),
         _ => (0.4 * saved.min(0.0), None), // walking into a fresh hang feels wrong to humans too
     }
 }
@@ -463,15 +470,15 @@ pub enum Grade {
 impl Grade {
     pub fn label(self) -> (&'static str, &'static str) {
         match self {
-            Grade::Brilliant => ("!!", "Brilliant!!"),
-            Grade::Great => ("!", "Great move!"),
-            Grade::Book => ("≡", "Book"),
-            Grade::Best => ("★", "Best"),
-            Grade::Excellent => ("✓", "Excellent"),
-            Grade::Good => ("✓", "Good"),
-            Grade::Inaccuracy => ("?!", "Inaccuracy"),
-            Grade::Mistake => ("?", "Mistake"),
-            Grade::Blunder => ("??", "Blunder"),
+            Grade::Brilliant => ("!!", tr("Brilliant!!", "Блестяще!!")),
+            Grade::Great => ("!", tr("Great move!", "Отличный ход!")),
+            Grade::Book => ("≡", tr("Book", "Теория")),
+            Grade::Best => ("★", tr("Best", "Лучший ход")),
+            Grade::Excellent => ("✓", tr("Excellent", "Превосходно")),
+            Grade::Good => ("✓", tr("Good", "Хороший ход")),
+            Grade::Inaccuracy => ("?!", tr("Inaccuracy", "Неточность")),
+            Grade::Mistake => ("?", tr("Mistake", "Ошибка")),
+            Grade::Blunder => ("??", tr("Blunder", "Зевок")),
         }
     }
 }
@@ -543,10 +550,10 @@ mod tests {
         let mv = |p: &Chess, u: &str| u.parse::<UciMove>().unwrap().to_move(p).unwrap();
         // black knight on f6 hit by a pawn on e5: moving it away is a "Defends!"
         let p = pos("rnbqkb1r/pppp1ppp/5n2/4P3/8/8/PPP2PPP/RNBQKBNR b KQkq - 0 3");
-        assert_eq!(react(&p, mv(&p, "f6e4")).1, Some("Defends!"));
+        assert_eq!(react(&p, mv(&p, "f6e4")).1, Some(tr("Defends!", "Защищается!")));
         // white queen left on g4 for the c8 bishop: taking it "Punishes!"
         let p = pos("rnbqkbnr/ppp1pppp/3p4/8/4P1Q1/8/PPPP1PPP/RNB1KBNR b KQkq - 1 2");
-        assert_eq!(react(&p, mv(&p, "c8g4")).1, Some("Punishes!"));
+        assert_eq!(react(&p, mv(&p, "c8g4")).1, Some(tr("Punishes!", "Наказывает!")));
     }
 }
 

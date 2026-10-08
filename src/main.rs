@@ -1,10 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod ai;
 mod book;
+mod i18n;
 mod overlay;
 mod skins;
 
 use ai::{Grade, MAGNUS, MAX_ELO};
+use i18n::{ru, tr};
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
 use shakmaty::{Chess, Color as Side, File, Move, Piece, Position, Rank, Role, Square};
@@ -30,6 +32,120 @@ const OPENINGS: [(&str, &str); 14] = [
     ("Trap: Scholar's Mate try", "e4 e5 Qh5 Nc6 Bc4"),
     ("Trap: Englund Gambit", "d4 e5 dxe5 Nc6 Nf3 Qe7"),
 ];
+
+const OPENINGS_RU: [&str; 14] = [
+    "Любая (боты играют как люди)",
+    "Итальянская партия",
+    "Испанская партия",
+    "Сицилианская защита",
+    "Французская защита",
+    "Защита Каро — Канн",
+    "Скандинавская защита",
+    "Ферзевый гамбит",
+    "Лондонская система",
+    "Староиндийская защита",
+    "Ловушка: атака Фегателло",
+    "Ловушка: гамбит Стаффорда",
+    "Ловушка: детский мат",
+    "Ловушка: гамбит Энглунда",
+];
+
+const TIERS_RU: [&str; 12] = [
+    "Картошка",
+    "Новичок",
+    "Любитель",
+    "Клубный игрок",
+    "Разрядник",
+    "Кандидат в мастера",
+    "Мастер",
+    "Гроссмейстер",
+    "МАГНУС КАРЛСЕН",
+    "Сильнее Магнуса",
+    "Предел человека",
+    "Идеальный человек",
+];
+
+fn tier_name(i: usize) -> &'static str {
+    tr(TIERS[i].1, TIERS_RU[i])
+}
+
+fn opening_name(i: usize) -> &'static str {
+    tr(OPENINGS[i].0, OPENINGS_RU[i])
+}
+
+fn skin_name(i: usize) -> &'static str {
+    tr(skins::SKINS[i], ["Классика", "Дерево", "Сталь", "Неон", "Трава"][i])
+}
+
+fn phase_name(i: usize) -> &'static str {
+    tr(book::PHASES[i], ["Дебют", "Миттельшпиль", "Пешечный эндшпиль", "Ладейный эндшпиль", "Эндшпиль с лёгкими фигурами", "Ферзевый эндшпиль"][i])
+}
+
+fn band_name(band: usize) -> String {
+    match (band, ru()) {
+        (0, true) => "до 800".into(),
+        (_, true) => book::band_label(band).replace('+', " и выше"),
+        _ => book::band_label(band),
+    }
+}
+
+fn mood_name(m: ai::Mood) -> &'static str {
+    match m {
+        ai::Mood::Calm => tr("CALM", "СПОКОЕН"),
+        ai::Mood::Attacking => tr("ATTACKING", "АТАКУЕТ"),
+        ai::Mood::Defending => tr("DEFENDING", "ЗАЩИЩАЕТСЯ"),
+        ai::Mood::Hurrying => tr("HURRYING", "ТОРОПИТСЯ"),
+    }
+}
+
+/// Russian names of opening families (Lichess names are English); the variation part is
+/// dropped in Russian, unknown families stay in English.
+fn opening_label(name: &str, ru: bool) -> String {
+    const RU: &[(&str, &str)] = &[
+        ("Sicilian Defense", "Сицилианская защита"), ("Ruy Lopez", "Испанская партия"),
+        ("Queen's Gambit Declined", "Отказанный ферзевый гамбит"), ("Queen's Gambit Accepted", "Принятый ферзевый гамбит"),
+        ("Queen's Gambit", "Ферзевый гамбит"), ("French Defense", "Французская защита"), ("Italian Game", "Итальянская партия"),
+        ("English Opening", "Английское начало"), ("King's Gambit Accepted", "Принятый королевский гамбит"),
+        ("King's Gambit Declined", "Отказанный королевский гамбит"), ("King's Gambit", "Королевский гамбит"),
+        ("King's Indian Defense", "Староиндийская защита"), ("King's Indian Attack", "Староиндийская атака"),
+        ("Caro-Kann Defense", "Защита Каро — Канн"), ("Nimzo-Indian Defense", "Защита Нимцовича"),
+        ("Queen's Pawn Game", "Дебют ферзевой пешки"), ("Semi-Slav Defense", "Полуславянская защита"),
+        ("Slav Defense", "Славянская защита"), ("Dutch Defense", "Голландская защита"), ("Benoni Defense", "Защита Бенони"),
+        ("Grünfeld Defense", "Защита Грюнфельда"), ("Neo-Grünfeld Defense", "Нео-Грюнфельд"),
+        ("Queen's Indian Defense", "Новоиндийская защита"), ("Bogo-Indian Defense", "Защита Боголюбова"),
+        ("Old Indian Defense", "Староиндийская защита (старая)"), ("Indian Defense", "Индийская защита"),
+        ("Alekhine Defense", "Защита Алехина"), ("Scotch Game", "Шотландская партия"), ("Petrov's Defense", "Русская партия"),
+        ("Four Knights Game", "Партия четырёх коней"), ("Three Knights Opening", "Партия трёх коней"),
+        ("Zukertort Opening", "Начало Цукерторта"), ("Scandinavian Defense", "Скандинавская защита"),
+        ("Philidor Defense", "Защита Филидора"), ("Réti Opening", "Дебют Рети"), ("Nimzowitsch Defense", "Защита Нимцовича"),
+        ("Vienna Game", "Венская партия"), ("Vienna Gambit", "Венский гамбит"), ("Bishop's Opening", "Дебют слона"),
+        ("Modern Defense", "Современная защита"), ("Robatsch Defense", "Защита Робача"), ("King's Pawn Game", "Дебют королевской пешки"),
+        ("King's Pawn Opening", "Дебют королевской пешки"), ("King's Knight Opening", "Дебют королевского коня"),
+        ("Catalan Opening", "Каталонское начало"), ("Pirc Defense", "Защита Пирца — Уфимцева"), ("Bird Opening", "Дебют Берда"),
+        ("Tarrasch Defense", "Защита Тарраша"), ("Polish Opening", "Польское начало"), ("Blackmar-Diemer Gambit", "Гамбит Блэкмара — Димера"),
+        ("Hungarian Opening", "Венгерское начало"), ("Grob Opening", "Дебют Гроба"), ("Nimzo-Larsen Attack", "Атака Нимцовича — Ларсена"),
+        ("Center Game", "Центральный дебют"), ("Latvian Gambit", "Латышский гамбит"), ("Ponziani Opening", "Дебют Понциани"),
+        ("Trompowsky Attack", "Атака Тромповского"), ("Benko Gambit", "Волжский гамбит"), ("Englund Gambit", "Гамбит Энглунда"),
+        ("Owen Defense", "Защита Оуэна"), ("Torre Attack", "Атака Торре"), ("London System", "Лондонская система"),
+        ("Colle System", "Система Колле"), ("Danish Gambit", "Датский гамбит"), ("Elephant Gambit", "Гамбит слона"),
+        ("Rapport-Jobava System", "Система Рапорта — Жобавы"), ("Hippopotamus Defense", "Защита «бегемот»"),
+        ("Budapest Defense", "Будапештский гамбит"), ("Van Geet Opening", "Дебют ван Геета"), ("Bongcloud Attack", "Атака Бонгклауд"),
+        ("Giuoco Piano", "Джуоко пиано"), ("Two Knights Defense", "Защита двух коней"), ("Owen's Defense", "Защита Оуэна"),
+    ];
+    if !ru {
+        return name.to_string();
+    }
+    let family = name.split([':', ',']).next().unwrap_or(name).trim();
+    // "Accepted"/"Declined" variants fall back to their base family
+    RU.iter()
+        .find(|(en, _)| *en == family)
+        .or_else(|| RU.iter().filter(|(en, _)| family.starts_with(en)).max_by_key(|(en, _)| en.len()))
+        .map_or(name.to_string(), |(_, ru)| ru.to_string())
+}
+
+fn tc_name(i: usize) -> &'static str {
+    if i == 0 { tr("No clock", "без часов") } else { TCS[i].0 }
+}
 
 /// (label, base seconds, increment)
 const TCS: [(&str, f32, f32); 5] = [("No clock", 0.0, 0.0), ("1+0", 60.0, 0.0), ("3+2", 180.0, 2.0), ("5+0", 300.0, 0.0), ("10+0", 600.0, 0.0)];
@@ -197,11 +313,11 @@ struct App {
     engine: ai::Engine,
     skin: usize,
     skin_tex: Option<Texture2D>,
-    piece_tex: Vec<Texture2D>,
+    piece_tex: Vec<skins::Sprite>,
     icons: Vec<Texture2D>,
     grass: Option<skins::Grass>,
     editor: Option<Editor>,
-    saved: (f32, usize, usize),
+    saved: (f32, usize, usize, bool),
     played: Vec<Move>,
     opening: usize,
     opening_name: Option<(String, f32)>,
@@ -217,6 +333,7 @@ struct App {
     win_drag: Option<(Vec2, Vec2)>,
     font: Font,
     bold: Font,
+    px_per_unit: std::cell::Cell<f32>,
 }
 
 impl App {
@@ -285,12 +402,12 @@ impl App {
     }
 
     fn save_settings(&mut self) {
-        let now = (self.elo.round(), self.skin, self.tc);
+        let now = (self.elo.round(), self.skin, self.tc, ru());
         if now != self.saved && !self.elo_drag {
             self.saved = now;
             if let Some(p) = settings_path() {
                 let _ = std::fs::create_dir_all(p.parent().unwrap());
-                let _ = std::fs::write(p, format!("elo={}\nskin={}\ntc={}\n", now.0, now.1, now.2));
+                let _ = std::fs::write(p, format!("elo={}\nskin={}\ntc={}\nlang={}\n", now.0, now.1, now.2, if now.3 { "ru" } else { "en" }));
             }
         }
     }
@@ -310,9 +427,9 @@ impl App {
                 self.editor = None;
                 self.new_game(side);
                 self.pos = p;
-                self.opening_name = Some(("Custom position".into(), 0.0));
+                self.opening_name = Some((tr("Custom position", "Своя позиция").into(), 0.0));
             }
-            Err(e) => ed.err = Some(format!("Not a legal position: {e}")),
+            Err(e) => ed.err = Some(format!("{}: {e}", tr("Not a legal position", "Недопустимая позиция"))),
         }
     }
 
@@ -335,6 +452,7 @@ impl App {
         args.extend(["--elo".into(), format!("{:.0}", self.elo), "--tc".into(), self.tc.to_string()]);
         args.extend(["--clock".into(), format!("{},{}", self.clock[0], self.clock[1])]);
         args.extend(["--opening".into(), self.opening.to_string(), "--skin".into(), self.skin.to_string()]);
+        args.extend(["--lang".into(), (if ru() { "ru" } else { "en" }).into()]);
         if overlay {
             args.push("--overlay".into());
         }
@@ -365,8 +483,8 @@ impl App {
         let c = self.sq_pos(sq);
         let col = grade_color(g);
         let label = match g {
-            Grade::Book => format!("Book · {:.0}% play this", share * 100.0),
-            _ if share > 0.0 && total >= 50 => format!("{} · {:.0}% play this", g.label().1, share * 100.0),
+            Grade::Book => format!("{} · {:.0}% {}", g.label().1, share * 100.0, tr("play this", "играют так")),
+            _ if share > 0.0 && total >= 50 => format!("{} · {:.0}% {}", g.label().1, share * 100.0, tr("play this", "играют так")),
             _ => g.label().1.to_string(),
         };
         self.toast(&label, c - vec2(0.0, 46.0), col);
@@ -530,8 +648,9 @@ impl App {
         if ph >= 2 && book::phase(self.history.last().unwrap_or(&self.pos), self.played.len().saturating_sub(1)) != ph {
             let band = book::band(self.elo);
             let label = match ai::book().slip_rate(band, ph) {
-                Some(r) => format!("{} · {} players slip on {:.0}% of moves here", book::PHASES[ph], book::band_label(band), r * 100.0),
-                None => book::PHASES[ph].to_string(),
+                Some(r) if ru() => format!("{} · игроки {} ошибаются здесь в {:.0}% ходов", phase_name(ph), band_name(band), r * 100.0),
+                Some(r) => format!("{} · {} players slip on {:.0}% of moves here", phase_name(ph), band_name(band), r * 100.0),
+                None => phase_name(ph).to_string(),
             };
             self.opening_name = Some((label, 0.0));
         } else if let Some(name) = ai::book().names.get(&book::key(&self.pos)) {
@@ -557,7 +676,7 @@ impl App {
         }
         if self.pos.is_checkmate() {
             let k = self.pos.board().king_of(self.pos.turn()).map(|k| self.sq_pos(k)).unwrap_or(dest);
-            self.toast("Checkmate!", k, RED);
+            self.toast(tr("Checkmate!", "Мат!"), k, RED);
             self.shake += 14.0;
             self.punch += 0.08;
             if self.pos.turn() != self.player {
@@ -565,7 +684,7 @@ impl App {
             }
         } else if self.pos.is_check() {
             let k = self.pos.board().king_of(self.pos.turn()).map(|k| self.sq_pos(k)).unwrap_or(dest);
-            self.toast("Check!", k, Color::new(1.0, 0.3, 0.3, 1.0));
+            self.toast(tr("Check!", "Шах!"), k, Color::new(1.0, 0.3, 0.3, 1.0));
             self.shake += 4.0;
         }
     }
@@ -769,7 +888,8 @@ impl App {
             let pop = ai::book().all(book::key(&self.pos));
             let total: u32 = pop.iter().map(|b| b.count).sum();
             if let Some(top) = pop.first().filter(|t| total >= 100 && t.count * 4 >= total && t.score() < 0.4) {
-                let msg = format!("Trap! {:.0}% of players go wrong here", 100.0 * top.count as f32 / total as f32);
+                let pct = 100.0 * top.count as f32 / total as f32;
+                let msg = if ru() { format!("Ловушка! {pct:.0}% игроков здесь ошибаются") } else { format!("Trap! {pct:.0}% of players go wrong here") };
                 self.toast(&msg, vec2(BOARD / 2.0, BOARD / 2.0), Color::new(1.0, 0.5, 0.3, 1.0));
             }
             let _ = self.engine.tx.send(ai::Req::Analyse { game_id: key.0, ply: key.1, pos: self.pos.clone() });
@@ -784,9 +904,9 @@ impl App {
                     if mood != self.mood && mood != ai::Mood::Calm {
                         if let Some(k) = self.pos.board().king_of(!self.player) {
                             let text = match mood {
-                                ai::Mood::Attacking => "Going for your king!",
-                                ai::Mood::Defending => "Bunkering down...",
-                                _ => "Time trouble!",
+                                ai::Mood::Attacking => tr("Going for your king!", "Идёт на вашего короля!"),
+                                ai::Mood::Defending => tr("Bunkering down...", "Уходит в глухую защиту..."),
+                                _ => tr("Time trouble!", "Цейтнот!"),
                             };
                             self.toast(text, self.sq_pos(k), mood_color(mood));
                         }
@@ -890,8 +1010,8 @@ impl App {
         let (sw, sh) = (screen_width(), screen_height());
         let x0 = sw - PANEL;
         draw_rectangle(x0, 0.0, PANEL, sh, Color::from_rgba(28, 28, 36, 255));
-        self.text("SET UP A POSITION", x0 + 30.0, 44.0, 18.0, WHITE, true);
-        self.text("pick a piece, click squares (click again to remove)", x0 + 30.0, 68.0, 12.0, GRAY, false);
+        self.text(tr("SET UP A POSITION", "РАССТАНОВКА ПОЗИЦИИ"), x0 + 30.0, 44.0, 18.0, WHITE, true);
+        self.text_fit(tr("pick a piece, click squares (click again to remove)", "выберите фигуру и кликайте по полям (повторно — убрать)"), x0 + 30.0, 68.0, 12.0, PANEL - 45.0, GRAY, false);
         let roles = [Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn];
         let mut pick = None;
         for (row, color) in [Side::White, Side::Black].into_iter().enumerate() {
@@ -909,15 +1029,15 @@ impl App {
         let bw = PANEL - 60.0;
         let half = bw / 2.0 - 5.0;
         let row = |i: f32| 204.0 + i * 54.0;
-        if self.button(Rect::new(x0 + 30.0, row(0.0), bw, 44.0), "Eraser") {
+        if self.button(Rect::new(x0 + 30.0, row(0.0), bw, 44.0), tr("Eraser", "Ластик")) {
             pick = Some(None);
         }
         let turn = self.editor.as_ref().unwrap().turn;
-        if self.button(Rect::new(x0 + 30.0, row(1.0), bw, 44.0), &format!("To move: {}", if turn == Side::White { "White" } else { "Black" })) {
+        if self.button(Rect::new(x0 + 30.0, row(1.0), bw, 44.0), &format!("{}: {}", tr("To move", "Ход"), if turn == Side::White { tr("White", "белые") } else { tr("Black", "чёрные") })) {
             let ed = self.editor.as_mut().unwrap();
             ed.turn = !ed.turn;
         }
-        if self.button(Rect::new(x0 + 30.0, row(2.0), half, 44.0), "Paste FEN") {
+        if self.button(Rect::new(x0 + 30.0, row(2.0), half, 44.0), tr("Paste FEN", "Вставить FEN")) {
             let ed = self.editor.as_mut().unwrap();
             let text = miniquad::window::clipboard_get().unwrap_or_default();
             match text.trim().parse::<shakmaty::fen::Fen>() {
@@ -927,24 +1047,24 @@ impl App {
                     ed.turn = setup.turn;
                     ed.err = None;
                 }
-                Err(e) => ed.err = Some(format!("Clipboard isn't a FEN ({e})")),
+                Err(e) => ed.err = Some(format!("{} ({e})", tr("Clipboard isn't a FEN", "В буфере обмена не FEN"))),
             }
         }
-        if self.button(Rect::new(x0 + 35.0 + half, row(2.0), half, 44.0), "Clear") {
+        if self.button(Rect::new(x0 + 35.0 + half, row(2.0), half, 44.0), tr("Clear", "Очистить")) {
             self.editor.as_mut().unwrap().board = shakmaty::Board::empty();
         }
-        if self.button(Rect::new(x0 + 30.0, row(3.0), bw, 44.0), "Starting position") {
+        if self.button(Rect::new(x0 + 30.0, row(3.0), bw, 44.0), tr("Starting position", "Начальная позиция")) {
             let ed = self.editor.as_mut().unwrap();
             ed.board = shakmaty::Board::new();
             ed.turn = Side::White;
         }
-        if self.button(Rect::new(x0 + 30.0, row(4.0), half, 44.0), "Play White") {
+        if self.button(Rect::new(x0 + 30.0, row(4.0), half, 44.0), tr("Play White", "Играть белыми")) {
             self.editor_play(Side::White);
         }
-        if self.button(Rect::new(x0 + 35.0 + half, row(4.0), half, 44.0), "Play Black") {
+        if self.button(Rect::new(x0 + 35.0 + half, row(4.0), half, 44.0), tr("Play Black", "Играть чёрными")) {
             self.editor_play(Side::Black);
         }
-        if self.button(Rect::new(x0 + 30.0, row(5.0), bw, 44.0), "Cancel") {
+        if self.button(Rect::new(x0 + 30.0, row(5.0), bw, 44.0), tr("Cancel", "Отмена")) {
             self.editor = None;
             return;
         }
@@ -964,30 +1084,51 @@ impl App {
 
     fn draw_piece(&self, p: Piece, c: Vec2, scale: f32, alpha: f32) {
         let alpha = alpha * self.board_alpha();
-        let tex = &self.piece_tex[skins::piece_index(p.color.is_white(), p.role)];
-        let w = SQ * 1.04 * scale;
-        let h = w * tex.height() / tex.width();
-        // in the renders the piece's base is at 90% of the image height, centred a touch left
-        let foot = c.y + SQ * 0.36 * scale;
-        let (left, top) = (c.x - w * 0.54, foot - h * 0.9);
+        let sp = &self.piece_tex[skins::piece_index(p.color.is_white(), p.role)];
+        // one scale per set (the king's visible height fills a square) keeps relative sizes;
+        // the visible outline is centred on the square and stands just above its bottom edge
+        let k = SQ * 1.02 * scale / self.piece_tex[0].bbox.h;
+        let (w, h) = (sp.tex.width() * k, sp.tex.height() * k);
+        let left = c.x - (sp.bbox.x + sp.bbox.w / 2.0) * k;
+        let top = c.y + SQ * 0.42 * scale - (sp.bbox.y + sp.bbox.h) * k;
         let dest = |w: f32, h: f32| DrawTextureParams { dest_size: Some(vec2(w, h)), ..Default::default() };
         if let Some(g) = skins::glow(self.skin, p.color.is_white()) {
             let pulse = 0.8 + 0.2 * (get_time() as f32 * 3.0).sin();
             for grow in [14.0, 7.0] {
-                draw_texture_ex(tex, left - grow / 2.0, top - grow / 2.0, with_a(g, 0.28 * alpha * pulse), dest(w + grow, h + grow));
+                draw_texture_ex(&sp.tex, left - grow / 2.0, top - grow / 2.0, with_a(g, 0.28 * alpha * pulse), dest(w + grow, h + grow));
             }
         }
-        draw_texture_ex(tex, left, top, with_a(WHITE, alpha), dest(w, h));
+        draw_texture_ex(&sp.tex, left, top, with_a(WHITE, alpha), dest(w, h));
+    }
+
+    /// Text is rasterised at the size it appears on screen (scaling one big raster down
+    /// blurs small labels and makes pairs like "To" overlap). On the zoomable board,
+    /// `px_per_unit` is the camera scale so it stays crisp when zoomed.
+    fn text_params(&self, size: f32, bold: bool) -> (Option<&Font>, u16, f32) {
+        let k = self.px_per_unit.get();
+        let font = if bold { &self.bold } else { &self.font };
+        let px = (size * k).round().max(1.0);
+        (Some(font), px as u16, size / px)
+    }
+
+    fn measure(&self, s: &str, size: f32, bold: bool) -> TextDimensions {
+        let (font, fs, scale) = self.text_params(size, bold);
+        measure_text(s, font, fs, scale)
     }
 
     fn text(&self, s: &str, x: f32, y: f32, size: f32, col: Color, bold: bool) -> TextDimensions {
-        let font = if bold { &self.bold } else { &self.font };
-        draw_text_ex(s, x, y, TextParams { font: Some(font), font_size: 64, font_scale: size / 64.0, color: col, ..Default::default() })
+        let (font, font_size, font_scale) = self.text_params(size, bold);
+        draw_text_ex(s, x, y, TextParams { font, font_size, font_scale, color: col, ..Default::default() })
+    }
+
+    /// Like `text`, shrunk if needed to fit `max_w`.
+    fn text_fit(&self, s: &str, x: f32, y: f32, size: f32, max_w: f32, col: Color, bold: bool) {
+        let w = self.measure(s, size, bold).width;
+        self.text(s, x, y, size * (max_w / w).min(1.0), col, bold);
     }
 
     fn text_c(&self, s: &str, c: Vec2, size: f32, col: Color, bold: bool) {
-        let font = if bold { &self.bold } else { &self.font };
-        let d = measure_text(s, Some(font), 64, size / 64.0);
+        let d = self.measure(s, size, bold);
         self.text(s, c.x - d.width / 2.0, c.y + d.offset_y - d.height / 2.0, size, col, bold);
     }
 
@@ -1184,7 +1325,7 @@ impl App {
         let col = if hov { Color::from_rgba(70, 70, 90, 255) } else { Color::from_rgba(50, 50, 64, 255) };
         draw_rectangle(r.x, r.y + 3.0, r.w, r.h, Color::new(0.0, 0.0, 0.0, 0.3));
         draw_rectangle(r.x, r.y + off, r.w, r.h, col);
-        let w = measure_text(label, Some(&self.bold), 64, 18.0 / 64.0).width;
+        let w = self.measure(label, 18.0, true).width;
         self.text_c(label, r.center() + vec2(0.0, off), 18.0 * ((r.w - 16.0) / w).min(1.0), WHITE, true);
         hov && is_mouse_button_pressed(MouseButton::Left)
     }
@@ -1199,14 +1340,17 @@ impl App {
         let e = self.elo_disp.clamp(1.0, MAX_ELO);
         let col = elo_color(e);
         let magnus = self.tier >= MAGNUS_TIER;
-        let d = self.text("OPPONENT", x0 + 30.0, 44.0, 16.0, GRAY, true);
-        let mood = format!("{:?}", self.mood).to_uppercase();
+        if self.button(Rect::new(sw - 62.0, 22.0, 44.0, 30.0), if ru() { "RU" } else { "EN" }) {
+            i18n::set_ru(!ru());
+        }
+        let d = self.text(tr("OPPONENT", "СОПЕРНИК"), x0 + 30.0, 44.0, 16.0, GRAY, true);
+        let mood = mood_name(self.mood);
         self.text(&format!("·  {mood}"), x0 + 40.0 + d.width, 44.0, 16.0, mood_color(self.mood), true);
         let pop = 1.0 + 0.35 * ease_out_back(self.tier_pop) * self.tier_pop + 0.06 * self.tick_pop;
         let num_col = if self.tier == MAGNUS_TIER { Color::new(1.0, 0.8 + 0.15 * (time * 6.0).sin(), 0.25, 1.0) } else { col };
         let d = self.text(&format!("{:.0}", e), x0 + 30.0, 108.0, 60.0 * pop, num_col, true);
-        self.text("ELO", x0 + 40.0 + d.width, 108.0, 18.0, GRAY, true);
-        self.text(TIERS[self.tier].1, x0 + 30.0, 145.0, 24.0 * (1.0 + 0.2 * self.tier_pop), col, true);
+        self.text(tr("ELO", "ЭЛО"), x0 + 40.0 + d.width, 108.0, 18.0, GRAY, true);
+        self.text(tier_name(self.tier), x0 + 30.0, 145.0, 24.0 * (1.0 + 0.2 * self.tier_pop), col, true);
 
         // the bar
         let b = self.bar_rect();
@@ -1243,7 +1387,7 @@ impl App {
                 draw_line(b.x + b.w + 18.0, y, b.x + b.w + 24.0, label_y, 1.0, with_a(c, 0.5));
             }
             let wob = if i == self.tier { 4.0 * self.tier_pop } else { 0.0 };
-            self.text(t.1, b.x + b.w + 26.0 + wob, label_y + 5.0, if i == self.tier { 16.0 } else { 13.0 }, c, i == self.tier);
+            self.text(tier_name(i), b.x + b.w + 26.0 + wob, label_y + 5.0, if i == self.tier { 16.0 } else { 13.0 }, c, i == self.tier);
             self.text(&format!("{:.0}", t.0), b.x + b.w + 212.0, label_y + 5.0, 12.0, with_a(c, 0.6), false);
         }
         // crown
@@ -1272,48 +1416,49 @@ impl App {
         // buttons
         let bw = PANEL - 60.0;
         let by = sh - 210.0;
-        if self.button(Rect::new(x0 + 30.0, by - 108.0, bw, 44.0), &format!("Practice: {}", OPENINGS[self.opening].0)) {
+        if self.button(Rect::new(x0 + 30.0, by - 108.0, bw, 44.0), &format!("{}: {}", tr("Practice", "Тренировка"), opening_name(self.opening))) {
             self.opening = (self.opening + 1) % OPENINGS.len();
             self.new_game(self.player);
         }
-        if self.button(Rect::new(x0 + 30.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("Clock: {}", TCS[self.tc].0)) {
+        if self.button(Rect::new(x0 + 30.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("{}: {}", tr("Clock", "Часы"), tc_name(self.tc))) {
             self.tc = (self.tc + 1) % TCS.len();
             self.new_game(self.player);
         }
-        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("Skin: {}", skins::SKINS[self.skin])) {
+        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("{}: {}", tr("Skin", "Стиль"), skin_name(self.skin))) {
             self.set_skin(self.skin + 1);
         }
-        if self.button(Rect::new(x0 + 30.0, by, bw / 2.0 - 5.0, 44.0), "Play White") {
+        if self.button(Rect::new(x0 + 30.0, by, bw / 2.0 - 5.0, 44.0), tr("Play White", "Играть белыми")) {
             self.new_game(Side::White);
         }
-        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by, bw / 2.0 - 5.0, 44.0), "Play Black") {
+        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by, bw / 2.0 - 5.0, 44.0), tr("Play Black", "Играть чёрными")) {
             self.new_game(Side::Black);
         }
         let third = (bw - 10.0) / 3.0;
-        if self.button(Rect::new(x0 + 30.0, by + 54.0, third, 44.0), "Undo") {
+        if self.button(Rect::new(x0 + 30.0, by + 54.0, third, 44.0), tr("Undo", "Отменить")) {
             self.undo();
         }
-        if self.button(Rect::new(x0 + 35.0 + third, by + 54.0, third, 44.0), "Overlay") {
+        if self.button(Rect::new(x0 + 35.0 + third, by + 54.0, third, 44.0), tr("Overlay", "Поверх окон")) {
             self.relaunch(true);
         }
-        if self.button(Rect::new(x0 + 40.0 + 2.0 * third, by + 54.0, third, 44.0), "Position") {
+        if self.button(Rect::new(x0 + 40.0 + 2.0 * third, by + 54.0, third, 44.0), tr("Position", "Позиция")) {
             self.editor = Some(Editor { board: self.pos.board().clone(), turn: self.pos.turn(), brush: Some(Piece { color: Side::White, role: Role::Queen }), err: None });
         }
         let status = if self.over() {
             match self.winner() {
-                Some(w) if w == self.player => "You won!".to_string(),
-                Some(_) => "You lost.".to_string(),
-                None => "Draw.".to_string(),
+                Some(w) if w == self.player => tr("You won!", "Вы победили!").to_string(),
+                Some(_) => tr("You lost.", "Вы проиграли.").to_string(),
+                None => tr("Draw.", "Ничья.").to_string(),
             }
         } else if self.pos.turn() == self.player {
-            "Your move".to_string()
+            tr("Your move", "Ваш ход").to_string()
         } else {
-            format!("Thinking{}", ".".repeat((time * 3.0) as usize % 4))
+            format!("{}{}", tr("Thinking", "Думает"), ".".repeat((time * 3.0) as usize % 4))
         };
-        self.text(&status, x0 + 30.0, by + 140.0, 22.0, WHITE, true);
-        self.text("wheel: zoom   right-drag: pan   R: reset", x0 + 30.0, sh - 30.0, 13.0, GRAY, false);
+        self.text_fit(&status, x0 + 30.0, by + 140.0, 22.0, PANEL - 45.0, WHITE, true);
+        self.text_fit(tr("wheel: zoom   right-drag: pan   R: reset", "колесо: масштаб · правая кнопка: сдвиг · R: сброс"), x0 + 30.0, sh - 30.0, 13.0, PANEL - 45.0, GRAY, false);
         let games = ai::book().games as f32 / 1e6;
-        self.text(&format!("scroll here: ELO · learned from {games:.1}M Lichess games"), x0 + 30.0, sh - 12.0, 12.0, GRAY, false);
+        let help = if ru() { format!("прокрутка здесь: Эло · обучены на {games:.1} млн партий Lichess") } else { format!("scroll here: ELO · learned from {games:.1}M Lichess games") };
+        self.text_fit(&help, x0 + 30.0, sh - 12.0, 12.0, PANEL - 45.0, GRAY, false);
     }
 
     fn draw_crown(&self, c: Vec2, s: f32, col: Color) {
@@ -1343,11 +1488,20 @@ impl App {
         draw_rectangle(0.0, sh / 2.0 - 60.0 * pop, sw - self.panel_w(), 120.0 * pop, Color::new(0.0, 0.0, 0.0, 0.55 * a));
         let on_time = self.flagged().is_some();
         let (title, sub) = match self.winner() {
-            Some(w) if w == self.player && on_time => ("ON TIME!", format!("The {:.0} ELO {} flagged", self.elo, TIERS[tier(self.elo)].1)),
-            Some(_) if on_time => ("Flagged", "Out of time. Move faster!".to_string()),
-            Some(w) if w == self.player => ("CHECKMATE!", format!("You beat the {:.0} ELO {}", self.elo, TIERS[tier(self.elo)].1)),
-            Some(_) => ("Checkmated", format!("{} ({:.0}) got you. Undo?", TIERS[tier(self.elo)].1, self.elo)),
-            None => ("Draw", "Nobody wins.".to_string()),
+            Some(w) if w == self.player && on_time => (
+                tr("ON TIME!", "ПО ВРЕМЕНИ!"),
+                if ru() { format!("У соперника ({}, {:.0}) упал флажок", tier_name(tier(self.elo)), self.elo) } else { format!("The {:.0} ELO {} flagged", self.elo, tier_name(tier(self.elo))) },
+            ),
+            Some(_) if on_time => (tr("Flagged", "Флажок упал"), tr("Out of time. Move faster!", "Время вышло. Ходите быстрее!").to_string()),
+            Some(w) if w == self.player => (
+                tr("CHECKMATE!", "МАТ!"),
+                if ru() { format!("Вы обыграли: {} ({:.0})", tier_name(tier(self.elo)), self.elo) } else { format!("You beat the {:.0} ELO {}", self.elo, tier_name(tier(self.elo))) },
+            ),
+            Some(_) => (
+                tr("Checkmated", "Вам мат"),
+                if ru() { format!("{} ({:.0}) вас переиграл. Отменить ход?", tier_name(tier(self.elo)), self.elo) } else { format!("{} ({:.0}) got you. Undo?", tier_name(tier(self.elo)), self.elo) },
+            ),
+            None => (tr("Draw", "Ничья"), tr("Nobody wins.", "Победителя нет.").to_string()),
         };
         self.text_c(title, vec2(cx, sh / 2.0 - 14.0), 54.0 * pop, with_a(WHITE, a), true);
         self.text_c(&sub, vec2(cx, sh / 2.0 + 34.0), 20.0 * pop, with_a(LIGHTGRAY, a), false);
@@ -1369,18 +1523,18 @@ impl App {
         }
         let pop = 1.0 + 0.3 * self.tier_pop + 0.06 * self.tick_pop;
         self.text_c(&format!("{:.0}", e), vec2(150.0, y + 18.0), 24.0 * pop, elo_color(e), true);
-        self.text_c(TIERS[self.tier].1, vec2(150.0, y + 38.0), 11.0, elo_color(e), true);
+        self.text_c(tier_name(self.tier), vec2(150.0, y + 38.0), 11.0, elo_color(e), true);
         if self.button(r1(208.0, 40.0), "+") {
             self.elo = (self.elo + 100.0).min(MAX_ELO);
         }
         let status = if self.over() {
-            "Game over".to_string()
+            tr("Game over", "Игра окончена").to_string()
         } else if self.tc > 0 {
             format!("{}  vs  {}", Self::fmt_clock(self.clock[self.player as usize]), Self::fmt_clock(self.clock[!self.player as usize]))
         } else if self.pos.turn() == self.player {
-            "Your move".to_string()
+            tr("Your move", "Ваш ход").to_string()
         } else {
-            "Thinking…".to_string()
+            tr("Thinking…", "Думает…").to_string()
         };
         self.text_c(&status, vec2((268.0 + sw) / 2.0, y + 26.0), 16.0, LIGHTGRAY, true);
         let labels = ["Undo", "New", "Skin", "Exit"];
@@ -1388,7 +1542,12 @@ impl App {
         let w = (sw - 2.0 * gap - gap * (labels.len() - 1) as f32) / labels.len() as f32;
         for (i, label) in labels.into_iter().enumerate() {
             let r = Rect::new(gap + i as f32 * (w + gap), y + 52.0, w, 38.0);
-            let text = if label == "Skin" { format!("Skin: {}", skins::SKINS[self.skin]) } else { label.to_string() };
+            let text = match label {
+                "Undo" => tr("Undo", "Отменить").to_string(),
+                "New" => tr("New", "Новая").to_string(),
+                "Skin" => format!("{}: {}", tr("Skin", "Стиль"), skin_name(self.skin)),
+                _ => tr("Exit", "Выход").to_string(),
+            };
             if self.button(r, &text) {
                 match label {
                     "Undo" => self.undo(),
@@ -1427,16 +1586,18 @@ impl App {
         let cam = self.camera(true);
         let wm = cam.screen_to_world(mouse_position().into());
         set_camera(&cam);
+        self.px_per_unit.set(self.scale());
         self.draw_world(wm);
+        self.px_per_unit.set(1.0);
         set_default_camera();
         self.draw_clocks();
         if let (Some((name, t)), None) = (&self.opening_name, &self.overlay) {
             let k = (t * 3.0).min(1.0);
-            self.text(name, 20.0 - 20.0 * (1.0 - k), 28.0, 17.0, with_a(Color::new(0.85, 0.75, 0.55, 1.0), k), true);
+            self.text(&opening_label(name, ru()), 20.0 - 20.0 * (1.0 - k), 28.0, 17.0, with_a(Color::new(0.85, 0.75, 0.55, 1.0), k), true);
         }
         if let (Some((url, who)), None) = (&self.real_game, &self.overlay) {
-            let label = format!("Bot is replaying a real game ({who}) · {} ↗", url.trim_start_matches("https://"));
-            let d = measure_text(&label, Some(&self.font), 64, 14.0 / 64.0);
+            let label = format!("{} ({who}) · {} ↗", tr("Bot is replaying a real game", "Бот повторяет реальную партию"), url.trim_start_matches("https://"));
+            let d = self.measure(&label, 14.0, false);
             let r = Rect::new(20.0, 38.0, d.width, 20.0);
             let hov = r.contains(mouse_position().into());
             self.text(&label, 20.0, 52.0, 14.0, if hov { Color::new(0.6, 0.85, 1.0, 1.0) } else { Color::new(0.45, 0.7, 0.95, 1.0) }, false);
@@ -1584,7 +1745,7 @@ async fn main() {
         .collect(),
         grass: None,
         editor: None,
-        saved: (0.0, usize::MAX, 0),
+        saved: (0.0, usize::MAX, 0, true),
         played: vec![],
         opening: arg("--opening").and_then(|o| o.parse().ok()).filter(|&o: &usize| o < OPENINGS.len()).unwrap_or(0),
         opening_name: None,
@@ -1600,12 +1761,24 @@ async fn main() {
         win_drag: None,
         font,
         bold,
+        px_per_unit: std::cell::Cell::new(1.0),
     };
+    i18n::set_ru(setting("lang").as_deref() != Some("en"));
     app.set_skin(setting("skin").and_then(|s| s.parse().ok()).unwrap_or(0));
-    app.saved = (app.elo.round(), app.skin, app.tc);
+    app.saved = (app.elo.round(), app.skin, app.tc, ru());
     loop {
         app.update();
         app.draw();
         next_frame().await;
     }
+}
+
+#[cfg(test)]
+#[test]
+fn russian_opening_names() {
+    assert_eq!(opening_label("Sicilian Defense: Najdorf Variation", true), "Сицилианская защита");
+    assert_eq!(opening_label("Queen's Gambit Declined: Exchange Variation", true), "Отказанный ферзевый гамбит");
+    assert_eq!(opening_label("Blackmar-Diemer Gambit Accepted: Ziegler Defense", true), "Гамбит Блэкмара — Димера");
+    assert_eq!(opening_label("Amar Opening: Paris Gambit", true), "Amar Opening: Paris Gambit");
+    assert_eq!(opening_label("Pirc Defense", false), "Pirc Defense");
 }
