@@ -1,0 +1,1188 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+mod ai;
+mod overlay;
+
+use ai::{Grade, MAGNUS};
+use macroquad::prelude::*;
+use macroquad::rand::gen_range;
+use shakmaty::{Chess, Color as Side, File, Move, Piece, Position, Rank, Role, Square};
+use std::f32::consts::PI;
+
+const SQ: f32 = 80.0;
+const BOARD: f32 = SQ * 8.0;
+const PANEL: f32 = 340.0;
+const STRIP: f32 = 56.0;
+/// (label, base seconds, increment)
+const TCS: [(&str, f32, f32); 5] = [("No clock", 0.0, 0.0), ("1+0", 60.0, 0.0), ("3+2", 180.0, 2.0), ("5+0", 300.0, 0.0), ("10+0", 600.0, 0.0)];
+
+const TIERS: [(f32, &str, [f32; 3]); 9] = [
+    (0.0, "Potato", [0.55, 0.8, 0.35]),
+    (400.0, "Beginner", [0.3, 0.85, 0.55]),
+    (800.0, "Casual", [0.25, 0.8, 0.85]),
+    (1200.0, "Club Player", [0.3, 0.55, 1.0]),
+    (1600.0, "Competitive", [0.55, 0.4, 1.0]),
+    (2000.0, "Expert", [0.85, 0.35, 0.95]),
+    (2300.0, "Master", [1.0, 0.35, 0.5]),
+    (2500.0, "Grandmaster", [1.0, 0.55, 0.2]),
+    (MAGNUS - 20.0, "MAGNUS CARLSEN", [1.0, 0.84, 0.2]),
+];
+
+fn tier(e: f32) -> usize {
+    TIERS.iter().rposition(|t| e >= t.0).unwrap_or(0)
+}
+
+fn elo_color(e: f32) -> Color {
+    let i = tier(e);
+    let (a, ca) = (TIERS[i].0, TIERS[i].2);
+    let (b, cb) = TIERS.get(i + 1).map_or((MAGNUS, ca), |t| (t.0, t.2));
+    let t = ((e - a) / (b - a).max(1.0)).clamp(0.0, 1.0);
+    Color::new(ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t, 1.0)
+}
+
+fn grade_color(g: Grade) -> Color {
+    match g {
+        Grade::Brilliant => Color::new(0.1, 0.8, 0.8, 1.0),
+        Grade::Great => Color::new(0.35, 0.55, 1.0, 1.0),
+        Grade::Best => Color::new(0.45, 0.75, 0.2, 1.0),
+        Grade::Excellent => Color::new(0.5, 0.8, 0.35, 1.0),
+        Grade::Good => Color::new(0.55, 0.7, 0.5, 1.0),
+        Grade::Inaccuracy => Color::new(0.95, 0.78, 0.2, 1.0),
+        Grade::Mistake => Color::new(1.0, 0.55, 0.15, 1.0),
+        Grade::Blunder => Color::new(0.95, 0.2, 0.2, 1.0),
+    }
+}
+
+fn mood_color(m: ai::Mood) -> Color {
+    match m {
+        ai::Mood::Calm => GRAY,
+        ai::Mood::Attacking => Color::new(1.0, 0.45, 0.3, 1.0),
+        ai::Mood::Defending => Color::new(0.4, 0.7, 1.0, 1.0),
+        ai::Mood::Hurrying => Color::new(1.0, 0.85, 0.2, 1.0),
+    }
+}
+
+fn with_a(c: Color, a: f32) -> Color {
+    Color::new(c.r, c.g, c.b, a)
+}
+
+fn ease_out_back(t: f32) -> f32 {
+    let c = 1.70158;
+    1.0 + (c + 1.0) * (t - 1.0).powi(3) + c * (t - 1.0).powi(2)
+}
+
+/// Where the king lands for castling (shakmaty encodes castling as king-takes-rook).
+fn ui_to(m: &Move) -> Square {
+    match *m {
+        Move::Castle { king, rook } => {
+            Square::from_coords(if rook.file() > king.file() { File::G } else { File::C }, king.rank())
+        }
+        _ => m.to(),
+    }
+}
+
+struct Particle {
+    p: Vec2,
+    v: Vec2,
+    g: f32,
+    life: f32,
+    max: f32,
+    col: Color,
+    size: f32,
+    screen: bool,
+}
+
+struct Toast {
+    text: String,
+    p: Vec2,
+    t: f32,
+    col: Color,
+}
+
+struct Slide {
+    piece: Piece,
+    from: Vec2,
+    to: Vec2,
+    dest: Square,
+}
+
+struct Anim {
+    slides: Vec<Slide>,
+    t: f32,
+    ghost: Option<(Piece, Vec2)>,
+    fx: bool,
+    tag: Option<&'static str>,
+}
+
+struct App {
+    pos: Chess,
+    history: Vec<Chess>,
+    last: Option<(Square, Square)>,
+    player: Side,
+    sel: Option<Square>,
+    sel_t: f32,
+    dragging: bool,
+    hover_amt: [f32; 64],
+    anim: Option<Anim>,
+    parts: Vec<Particle>,
+    toasts: Vec<Toast>,
+    zoom: f32,
+    zoom_to: f32,
+    center: Vec2,
+    center_to: Vec2,
+    shake: f32,
+    punch: f32,
+    pan_last: Option<Vec2>,
+    elo: f32,
+    elo_disp: f32,
+    elo_vel: f32,
+    elo_drag: bool,
+    tier: usize,
+    tier_pop: f32,
+    tick_pop: f32,
+    game_id: u64,
+    waiting: bool,
+    think_start: f64,
+    pending: Option<(Move, Option<&'static str>, f64)>,
+    over_t: f32,
+    engine: ai::Engine,
+    tc: usize,
+    clock: [f32; 2], // indexed by Side as usize: black 0, white 1
+    mood: ai::Mood,
+    overlay: Option<overlay::Overlay>,
+    analysis: Option<(usize, Vec<(Move, i32)>)>,
+    analysed: Option<(u64, usize)>,
+    want_grade: Option<(usize, Chess, Move, Square)>,
+    badge: Option<(Square, Grade, f32)>,
+    win_drag: Option<(Vec2, Vec2)>,
+    font: Font,
+    bold: Font,
+}
+
+impl App {
+    fn new_game(&mut self, side: Side) {
+        self.pos = Chess::default();
+        self.history.clear();
+        self.player = side;
+        self.clock = [TCS[self.tc].1; 2];
+        self.mood = ai::Mood::Calm;
+        self.reset_turn_state();
+    }
+
+    fn flagged(&self) -> Option<Side> {
+        [Side::White, Side::Black].into_iter().find(|&s| self.tc > 0 && self.clock[s as usize] <= 0.0)
+    }
+
+    fn over(&self) -> bool {
+        self.pos.is_game_over() || self.flagged().is_some()
+    }
+
+    fn winner(&self) -> Option<Side> {
+        self.flagged().map(|s| !s).or(self.pos.outcome().winner())
+    }
+
+    fn fmt_clock(t: f32) -> String {
+        let t = t.max(0.0);
+        if t < 10.0 { format!("{:.1}", t) } else { format!("{}:{:02}", t as u32 / 60, t as u32 % 60) }
+    }
+
+    fn reset_turn_state(&mut self) {
+        self.last = None;
+        self.sel = None;
+        self.dragging = false;
+        self.anim = None;
+        self.game_id += 1;
+        self.waiting = false;
+        self.pending = None;
+        self.over_t = 0.0;
+        self.analysis = None;
+        self.want_grade = None;
+        self.badge = None;
+        self.engine.stop();
+    }
+
+    fn board_alpha(&self) -> f32 {
+        if self.overlay.is_some() { 0.88 } else { 1.0 }
+    }
+
+    fn panel_w(&self) -> f32 {
+        if self.overlay.is_some() { 0.0 } else { PANEL }
+    }
+
+    fn strip_h(&self) -> f32 {
+        if self.overlay.is_some() { STRIP } else { 0.0 }
+    }
+
+    /// Restart in the other mode, carrying the game over (window flags can't change at runtime).
+    fn relaunch(&self, overlay: bool) {
+        let fen = shakmaty::fen::Fen::from_position(&self.pos, shakmaty::EnPassantMode::Legal).to_string();
+        let mut args = vec!["--fen".to_string(), fen, "--side".into(), (if self.player == Side::White { "w" } else { "b" }).into()];
+        args.extend(["--elo".into(), format!("{:.0}", self.elo), "--tc".into(), self.tc.to_string()]);
+        args.extend(["--clock".into(), format!("{},{}", self.clock[0], self.clock[1])]);
+        if overlay {
+            args.push("--overlay".into());
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if std::process::Command::new(exe).args(args).spawn().is_ok() {
+                std::process::exit(0);
+            }
+        }
+    }
+
+    fn try_grade(&mut self) {
+        let (Some((ply, before, m, sq)), Some((aply, lines))) = (&self.want_grade, &self.analysis) else { return };
+        if ply != aply {
+            return;
+        }
+        let (sq, grade) = (*sq, ai::classify(before, lines, *m));
+        self.want_grade = None;
+        let Some(g) = grade else { return };
+        self.badge = Some((sq, g, 0.0));
+        let c = self.sq_pos(sq);
+        let col = grade_color(g);
+        self.toast(g.label().1, c - vec2(0.0, 46.0), col);
+        match g {
+            Grade::Brilliant => {
+                self.burst(c, col, 60, 340.0, false);
+                self.burst(c, WHITE, 20, 200.0, false);
+                self.punch += 0.07;
+            }
+            Grade::Great => {
+                self.burst(c, col, 35, 260.0, false);
+                self.punch += 0.04;
+            }
+            Grade::Best | Grade::Excellent => self.burst(c, col, 14, 150.0, false),
+            Grade::Mistake => self.shake += 6.0,
+            Grade::Blunder => {
+                self.shake += 16.0;
+                self.burst(c, col, 30, 220.0, false);
+            }
+            _ => {}
+        }
+    }
+
+    fn undo(&mut self) {
+        while let Some(p) = self.history.pop() {
+            self.pos = p;
+            if self.pos.turn() == self.player {
+                break;
+            }
+        }
+        self.reset_turn_state();
+    }
+
+    fn sq_pos(&self, sq: Square) -> Vec2 {
+        let (f, r) = (sq.file().to_u32() as f32, sq.rank().to_u32() as f32);
+        let (x, y) = if self.player == Side::Black { (7.0 - f, r) } else { (f, 7.0 - r) };
+        vec2(x * SQ + SQ / 2.0, y * SQ + SQ / 2.0)
+    }
+
+    fn world_sq(&self, p: Vec2) -> Option<Square> {
+        if p.x < 0.0 || p.y < 0.0 || p.x >= BOARD || p.y >= BOARD {
+            return None;
+        }
+        let (x, y) = ((p.x / SQ) as u32, (p.y / SQ) as u32);
+        let (f, r) = if self.player == Side::Black { (7 - x, y) } else { (x, 7 - y) };
+        Some(Square::from_coords(File::new(f), Rank::new(r)))
+    }
+
+    fn find_move(&self, from: Square, to: Square) -> Option<Move> {
+        // ponytail: auto-queen, add a picker if underpromotion ever matters
+        self.pos.legal_moves().into_iter().find(|m| {
+            m.from() == Some(from) && ui_to(m) == to && matches!(m.promotion(), None | Some(Role::Queen))
+        })
+    }
+
+    fn scale(&self) -> f32 {
+        let margin = if self.overlay.is_some() { 0.95 } else { 0.86 };
+        (screen_width() - self.panel_w()).min(screen_height() - self.strip_h()) * margin / BOARD * self.zoom * (1.0 + self.punch)
+    }
+
+    fn camera(&self, jitter: bool) -> Camera2D {
+        let (sw, sh) = (screen_width(), screen_height());
+        let s = self.scale();
+        let j = if jitter { vec2(gen_range(-1.0, 1.0), gen_range(-1.0, 1.0)) * self.shake / s } else { Vec2::ZERO };
+        Camera2D {
+            target: self.center + j,
+            zoom: vec2(2.0 * s / sw, 2.0 * s / sh),
+            offset: vec2((sw - self.panel_w()) / sw - 1.0, self.strip_h() / sh),
+            ..Default::default()
+        }
+    }
+
+    fn bar_rect(&self) -> Rect {
+        Rect::new(screen_width() - PANEL + 50.0, 225.0, 34.0, screen_height() - 225.0 - 300.0)
+    }
+
+    fn knob_y(&self) -> f32 {
+        let b = self.bar_rect();
+        let f = ((self.elo_disp - 1.0) / (MAGNUS - 1.0)).clamp(-0.03, 1.03);
+        b.y + b.h * (1.0 - f)
+    }
+
+    fn burst(&mut self, at: Vec2, col: Color, n: usize, speed: f32, screen: bool) {
+        for _ in 0..n {
+            let a = gen_range(0.0, PI * 2.0);
+            let v = vec2(a.cos(), a.sin()) * gen_range(0.2, 1.0) * speed;
+            let max = gen_range(0.4, 0.9);
+            self.parts.push(Particle { p: at, v, g: 0.0, life: max, max, col, size: gen_range(2.0, 6.0), screen });
+        }
+    }
+
+    fn confetti(&mut self) {
+        for _ in 0..220 {
+            let col = Color::new(gen_range(0.4, 1.0), gen_range(0.4, 1.0), gen_range(0.4, 1.0), 1.0);
+            let max = gen_range(2.0, 3.5);
+            self.parts.push(Particle {
+                p: vec2(gen_range(0.0, BOARD), gen_range(-200.0, -20.0)),
+                v: vec2(gen_range(-80.0, 80.0), gen_range(0.0, 200.0)),
+                g: 260.0,
+                life: max,
+                max,
+                col,
+                size: gen_range(4.0, 8.0),
+                screen: false,
+            });
+        }
+    }
+
+    fn toast(&mut self, text: &str, p: Vec2, col: Color) {
+        self.toasts.push(Toast { text: text.into(), p, t: 0.0, col });
+    }
+
+    fn play(&mut self, m: Move, start: Option<Vec2>, tag: Option<&'static str>) {
+        let from = m.from().unwrap();
+        let to = ui_to(&m);
+        let mover = self.pos.turn();
+        if self.tc > 0 {
+            self.clock[mover as usize] += TCS[self.tc].2;
+        }
+        let cap_sq = if m.is_en_passant() {
+            Some(Square::from_coords(m.to().file(), from.rank()))
+        } else {
+            m.capture().map(|_| m.to())
+        };
+        let ghost = cap_sq.and_then(|s| self.pos.board().piece_at(s).map(|p| (p, self.sq_pos(s))));
+        self.badge = None;
+        if mover == self.player {
+            self.want_grade = Some((self.history.len(), self.pos.clone(), m, to));
+            if self.analysis.as_ref().map(|a| a.0) != Some(self.history.len()) {
+                self.engine.stop(); // analysis still running: take what it has now
+            }
+        }
+        self.history.push(self.pos.clone());
+        self.pos.play_unchecked(m);
+
+        let mut slides = vec![Slide {
+            piece: self.pos.board().piece_at(to).unwrap(),
+            from: start.unwrap_or(self.sq_pos(from)),
+            to: self.sq_pos(to),
+            dest: to,
+        }];
+        if let Move::Castle { king, rook } = m {
+            let rto = Square::from_coords(if rook.file() > king.file() { File::F } else { File::D }, king.rank());
+            slides.push(Slide { piece: Piece { color: mover, role: Role::Rook }, from: self.sq_pos(rook), to: self.sq_pos(rto), dest: rto });
+        }
+        self.anim = Some(Anim { slides, t: 0.0, ghost, fx: true, tag });
+        self.last = Some((from, to));
+        self.sel = None;
+        self.dragging = false;
+        self.try_grade();
+    }
+
+    fn landed(&mut self, a: Anim) {
+        if !a.fx {
+            return;
+        }
+        let dest = a.slides[0].to;
+        if let Some((p, at)) = a.ghost {
+            let col = if p.color.is_white() { Color::new(0.98, 0.95, 0.88, 1.0) } else { Color::new(0.15, 0.15, 0.2, 1.0) };
+            self.burst(at, col, 30, 260.0, false);
+            self.burst(at, ORANGE, 10, 180.0, false);
+            self.shake += 7.0;
+            self.punch += 0.035;
+        } else {
+            self.burst(dest, Color::new(1.0, 1.0, 1.0, 0.5), 6, 70.0, false);
+        }
+        if let Some(t) = a.tag {
+            self.toast(t, dest - vec2(0.0, 40.0), elo_color(self.elo));
+        }
+        if self.pos.is_checkmate() {
+            let k = self.pos.board().king_of(self.pos.turn()).map(|k| self.sq_pos(k)).unwrap_or(dest);
+            self.toast("Checkmate!", k, RED);
+            self.shake += 14.0;
+            self.punch += 0.08;
+            if self.pos.turn() != self.player {
+                self.confetti();
+            }
+        } else if self.pos.is_check() {
+            let k = self.pos.board().king_of(self.pos.turn()).map(|k| self.sq_pos(k)).unwrap_or(dest);
+            self.toast("Check!", k, Color::new(1.0, 0.3, 0.3, 1.0));
+            self.shake += 4.0;
+        }
+    }
+
+    fn update(&mut self) {
+        let dt = get_frame_time().min(0.05);
+        let sw = screen_width();
+        let mouse: Vec2 = mouse_position().into();
+        let wm = self.camera(false).screen_to_world(mouse);
+        let sh = screen_height();
+        let on_board_side = mouse.x < sw - self.panel_w() && mouse.y < sh - self.strip_h();
+        let wheel = mouse_wheel().1;
+
+        // --- ELO slider ---
+        let bar = self.bar_rect();
+        let grab = Rect::new(bar.x - 40.0, bar.y - 30.0, bar.w + 80.0, bar.h + 60.0);
+        if is_mouse_button_pressed(MouseButton::Left) && grab.contains(mouse) && self.overlay.is_none() {
+            self.elo_drag = true;
+        }
+        if !is_mouse_button_down(MouseButton::Left) {
+            self.elo_drag = false;
+        }
+        if self.elo_drag {
+            self.elo = ((bar.y + bar.h - mouse.y) / bar.h).clamp(0.0, 1.0) * (MAGNUS - 1.0) + 1.0;
+        }
+        if wheel != 0.0 && !on_board_side {
+            self.elo = (self.elo + wheel.signum() * 25.0).clamp(1.0, MAGNUS);
+        }
+        if is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Down) {
+            let d = if is_key_pressed(KeyCode::Up) { 100.0 } else { -100.0 };
+            self.elo = (self.elo + d).clamp(1.0, MAGNUS);
+        }
+        let prev = self.elo_disp;
+        let acc = 240.0 * (self.elo - self.elo_disp) - 15.0 * self.elo_vel;
+        self.elo_vel += acc * dt;
+        self.elo_disp += self.elo_vel * dt;
+        if (self.elo_disp / 100.0).floor() != (prev / 100.0).floor() {
+            self.tick_pop = 1.0;
+        }
+        let t = tier(self.elo_disp.clamp(1.0, MAGNUS));
+        if t != self.tier {
+            let up = t > self.tier;
+            self.tier = t;
+            self.tier_pop = 1.0;
+            let at = if self.overlay.is_some() { vec2(130.0, sh - STRIP / 2.0) } else { vec2(bar.center().x, self.knob_y()) };
+            let n = if up { 20 + t * 8 } else { 12 };
+            self.burst(at, elo_color(self.elo_disp), n, 220.0 + t as f32 * 40.0, true);
+        }
+        if self.tier == TIERS.len() - 1 && self.overlay.is_none() && gen_range(0.0, 1.0) < 0.5 {
+            let at = vec2(bar.center().x + gen_range(-30.0, 30.0), bar.y - 30.0 + gen_range(-20.0, 20.0));
+            self.burst(at, GOLD, 1, 60.0, true);
+        }
+        self.tier_pop = (self.tier_pop - dt * 2.5).max(0.0);
+        self.tick_pop = (self.tick_pop - dt * 6.0).max(0.0);
+
+        // --- camera: wheel zooms toward cursor, right/middle drag pans, R resets ---
+        if on_board_side && wheel != 0.0 {
+            let old = self.zoom_to;
+            self.zoom_to = (old * if wheel > 0.0 { 1.18 } else { 1.0 / 1.18 }).clamp(1.0, 4.0);
+            self.center_to = wm - (wm - self.center_to) * (old / self.zoom_to);
+        }
+        if is_mouse_button_down(MouseButton::Right) || is_mouse_button_down(MouseButton::Middle) {
+            if let Some(l) = self.pan_last {
+                self.center_to += (l - mouse) / self.scale();
+            }
+            self.pan_last = Some(mouse);
+        } else {
+            self.pan_last = None;
+        }
+        if is_key_pressed(KeyCode::R) {
+            self.zoom_to = 1.0;
+        }
+        if self.zoom_to <= 1.001 {
+            self.center_to = vec2(BOARD / 2.0, BOARD / 2.0);
+        }
+        self.center_to = self.center_to.clamp(Vec2::ZERO, Vec2::splat(BOARD));
+        let k = 1.0 - (-dt * 12.0).exp();
+        self.zoom += (self.zoom_to - self.zoom) * k;
+        self.center += (self.center_to - self.center) * k;
+        self.shake *= (-dt * 9.0).exp();
+        self.punch *= (-dt * 7.0).exp();
+
+        // --- animations / fx ---
+        if let Some(a) = &mut self.anim {
+            a.t += dt / if a.fx { 0.26 } else { 0.14 };
+            if a.t >= 1.0 {
+                let a = self.anim.take().unwrap();
+                self.landed(a);
+            }
+        }
+        for p in &mut self.parts {
+            p.v.y += p.g * dt;
+            p.v *= if p.g > 0.0 { 1.0 } else { (-dt * 3.0).exp() };
+            p.p += p.v * dt;
+            p.life -= dt;
+        }
+        self.parts.retain(|p| p.life > 0.0);
+        for t in &mut self.toasts {
+            t.t += dt;
+        }
+        self.toasts.retain(|t| t.t < 1.6);
+        self.sel_t += dt;
+        if let Some(b) = &mut self.badge {
+            b.2 += dt;
+        }
+        let over = self.over();
+        if self.tc > 0 && !over && !self.history.is_empty() {
+            self.clock[self.pos.turn() as usize] -= dt;
+        }
+        if over && self.anim.is_none() {
+            self.over_t += dt;
+        }
+
+        // --- player input ---
+        let hover = if on_board_side { self.world_sq(wm) } else { None };
+        let my_turn = self.pos.turn() == self.player && !over && self.anim.is_none();
+        for (i, h) in self.hover_amt.iter_mut().enumerate() {
+            let on = my_turn && hover.map(|s| s as usize) == Some(i) && !self.dragging;
+            *h += ((on as u8 as f32) - *h) * (1.0 - (-dt * 18.0).exp());
+        }
+        if my_turn && !self.elo_drag {
+            if is_mouse_button_pressed(MouseButton::Left) && on_board_side {
+                if let Some(m) = self.sel.zip(hover).and_then(|(s, h)| self.find_move(s, h)) {
+                    self.play(m, None, None);
+                } else if let Some(h) = hover.filter(|&h| self.pos.board().piece_at(h).is_some_and(|p| p.color == self.player)) {
+                    if self.sel != Some(h) {
+                        self.sel_t = 0.0;
+                    }
+                    self.sel = Some(h);
+                    self.dragging = true;
+                } else {
+                    self.sel = None;
+                }
+            }
+            if is_mouse_button_released(MouseButton::Left) && self.dragging {
+                self.dragging = false;
+                let s = self.sel.unwrap();
+                match hover.filter(|&h| h != s).and_then(|h| self.find_move(s, h)) {
+                    Some(m) => self.play(m, Some(wm), None),
+                    None if hover != Some(s) => {
+                        // snap back
+                        let piece = self.pos.board().piece_at(s).unwrap();
+                        let slide = Slide { piece, from: wm, to: self.sq_pos(s), dest: s };
+                        self.anim = Some(Anim { slides: vec![slide], t: 0.0, ghost: None, fx: false, tag: None });
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        // --- AI ---
+        if !over && self.pos.turn() != self.player && self.anim.is_none() && !self.waiting && self.pending.is_none() {
+            let clock = (self.tc > 0).then(|| self.clock[!self.player as usize]);
+            let req = ai::Req::Think { game_id: self.game_id, pos: self.pos.clone(), elo: self.elo, clock };
+            if self.engine.tx.send(req).is_ok() {
+                self.waiting = true;
+                self.think_start = get_time();
+            }
+        }
+        // grade-in-advance: analyse every legal move while the player is thinking
+        let key = (self.game_id, self.history.len());
+        if !over && self.pos.turn() == self.player && self.analysed != Some(key) {
+            self.analysed = Some(key);
+            let _ = self.engine.tx.send(ai::Req::Analyse { game_id: key.0, ply: key.1, pos: self.pos.clone() });
+        }
+        while let Ok(r) = self.engine.rx.try_recv() {
+            match r {
+                ai::Reply::Move { game_id, mv, tag, mood } if game_id == self.game_id => {
+                    self.waiting = false;
+                    if mood != self.mood && mood != ai::Mood::Calm {
+                        if let Some(k) = self.pos.board().king_of(!self.player) {
+                            let text = match mood {
+                                ai::Mood::Attacking => "Going for your king!",
+                                ai::Mood::Defending => "Bunkering down...",
+                                _ => "Time trouble!",
+                            };
+                            self.toast(text, self.sq_pos(k), mood_color(mood));
+                        }
+                    }
+                    self.mood = mood;
+                    if let Some(m) = mv {
+                        // humans don't move instantly; on a clock they budget, and panic when low
+                        let think = match self.tc {
+                            0 => gen_range(0.35, 1.2),
+                            _ => (self.clock[!self.player as usize] / 40.0 * gen_range(0.3, 1.5)).clamp(0.15, 8.0),
+                        };
+                        self.pending = Some((m, tag, self.think_start + think as f64));
+                    }
+                }
+                ai::Reply::Analysis { game_id, ply, lines } if game_id == self.game_id => {
+                    self.analysis = Some((ply, lines));
+                    self.try_grade();
+                }
+                _ => {}
+            }
+        }
+        if let Some((m, tag, at)) = self.pending {
+            if get_time() >= at && self.anim.is_none() {
+                self.pending = None;
+                self.play(m, None, tag);
+            }
+        }
+
+        // --- overlay: drag window by the grip, tell the OS which pixels are clickable ---
+        if self.overlay.is_some() {
+            let win: Vec2 = { let p = miniquad::window::get_window_position(); vec2(p.0 as f32, p.1 as f32) };
+            if is_mouse_button_pressed(MouseButton::Left) && Rect::new(0.0, sh - STRIP, 40.0, STRIP).contains(mouse) {
+                self.win_drag = Some((win + mouse, win));
+            }
+            if !is_mouse_button_down(MouseButton::Left) {
+                self.win_drag = None;
+            }
+            if let Some((grab, start)) = self.win_drag {
+                let p = (start + win + mouse - grab).max(Vec2::ZERO);
+                miniquad::window::set_window_position(p.x as u32, p.y as u32);
+            }
+            let hit = if is_mouse_button_down(MouseButton::Left) || self.dragging {
+                vec![Rect::new(0.0, 0.0, sw, sh)]
+            } else {
+                let cam = self.camera(false);
+                let mut squares: Vec<Square> = vec![];
+                if my_turn {
+                    squares.extend(self.pos.board().by_color(self.player));
+                    if let Some(s) = self.sel {
+                        squares.extend(self.pos.legal_moves().iter().filter(|m| m.from() == Some(s)).map(ui_to));
+                    }
+                }
+                let mut hit: Vec<Rect> = squares
+                    .into_iter()
+                    .map(|s| {
+                        let c = self.sq_pos(s);
+                        let a = cam.world_to_screen(c - Vec2::splat(SQ / 2.0));
+                        let b = cam.world_to_screen(c + Vec2::splat(SQ / 2.0));
+                        Rect::new(a.x, a.y, b.x - a.x, b.y - a.y)
+                    })
+                    .collect();
+                hit.push(Rect::new(0.0, sh - STRIP, sw, STRIP));
+                hit
+            };
+            self.overlay.as_mut().unwrap().update(&hit);
+        }
+    }
+
+    // ---------------- drawing ----------------
+
+    fn draw_piece(&self, p: Piece, c: Vec2, scale: f32, alpha: f32) {
+        let ch = match p.role {
+            Role::King => "♚",
+            Role::Queen => "♛",
+            Role::Rook => "♜",
+            Role::Bishop => "♝",
+            Role::Knight => "♞",
+            Role::Pawn => "♟",
+        };
+        let alpha = alpha * self.board_alpha();
+        let size = SQ * 0.84 * scale;
+        let fs = 128u16;
+        let fsc = size / fs as f32;
+        let d = measure_text(ch, Some(&self.font), fs, fsc);
+        let x = c.x - d.width / 2.0;
+        let y = c.y + d.offset_y - d.height / 2.0;
+        draw_ellipse(c.x, c.y + size * 0.4, size * 0.3 * scale, size * 0.07, 0.0, Color::new(0.0, 0.0, 0.0, 0.22 * alpha));
+        let (fill, line) = if p.color.is_white() {
+            (Color::new(0.99, 0.97, 0.92, alpha), Color::new(0.1, 0.08, 0.08, alpha))
+        } else {
+            (Color::new(0.13, 0.13, 0.16, alpha), Color::new(0.92, 0.9, 0.86, 0.75 * alpha))
+        };
+        let o = size * 0.028;
+        let tp = |col| TextParams { font: Some(&self.font), font_size: fs, font_scale: fsc, color: col, ..Default::default() };
+        for i in 0..8 {
+            let a = i as f32 * PI / 4.0;
+            draw_text_ex(ch, x + a.cos() * o, y + a.sin() * o, tp(line));
+        }
+        draw_text_ex(ch, x, y, tp(fill));
+    }
+
+    fn text(&self, s: &str, x: f32, y: f32, size: f32, col: Color, bold: bool) -> TextDimensions {
+        let font = if bold { &self.bold } else { &self.font };
+        draw_text_ex(s, x, y, TextParams { font: Some(font), font_size: 64, font_scale: size / 64.0, color: col, ..Default::default() })
+    }
+
+    fn text_c(&self, s: &str, c: Vec2, size: f32, col: Color, bold: bool) {
+        let font = if bold { &self.bold } else { &self.font };
+        let d = measure_text(s, Some(font), 64, size / 64.0);
+        self.text(s, c.x - d.width / 2.0, c.y + d.offset_y - d.height / 2.0, size, col, bold);
+    }
+
+    fn draw_board(&self) {
+        let time = get_time() as f32;
+        let ba = self.board_alpha();
+        if self.overlay.is_none() {
+            draw_rectangle(-10.0, -2.0, BOARD + 26.0, BOARD + 26.0, Color::new(0.0, 0.0, 0.0, 0.35));
+        }
+        draw_rectangle(-16.0, -16.0, BOARD + 32.0, BOARD + 32.0, with_a(Color::from_rgba(58, 40, 30, 255), ba));
+        for i in 0..64u32 {
+            let sq = Square::new(i);
+            let c = self.sq_pos(sq);
+            let light = (sq.file().to_u32() + sq.rank().to_u32()) % 2 == 1;
+            let col = if light { Color::from_rgba(238, 218, 186, 255) } else { Color::from_rgba(180, 135, 99, 255) };
+            draw_rectangle(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, with_a(col, ba));
+            let h = self.hover_amt[i as usize];
+            if h > 0.01 {
+                draw_rectangle(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, Color::new(1.0, 1.0, 1.0, 0.18 * h));
+            }
+        }
+        if let Some((a, b)) = self.last {
+            for s in [a, b] {
+                let c = self.sq_pos(s);
+                draw_rectangle(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, Color::new(1.0, 0.85, 0.2, 0.35));
+            }
+        }
+        if let Some(s) = self.sel {
+            let c = self.sq_pos(s);
+            draw_rectangle(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, Color::new(0.3, 0.7, 1.0, 0.4));
+        }
+        if self.pos.is_check() && self.anim.is_none() {
+            if let Some(k) = self.pos.board().king_of(self.pos.turn()) {
+                let c = self.sq_pos(k);
+                let pulse = 0.8 + 0.2 * (time * 8.0).sin();
+                for i in 0..7 {
+                    draw_circle(c.x, c.y, SQ * 0.62 * pulse * (1.0 - i as f32 / 8.0), Color::new(1.0, 0.1, 0.1, 0.12));
+                }
+            }
+        }
+        // coordinates
+        for i in 0..8u32 {
+            let f = Square::from_coords(File::new(i), if self.player == Side::White { Rank::First } else { Rank::Eighth });
+            let r = Square::from_coords(if self.player == Side::White { File::A } else { File::H }, Rank::new(i));
+            let col = Color::new(0.3, 0.2, 0.15, 0.7);
+            let c = self.sq_pos(f);
+            self.text(&f.file().char().to_string(), c.x + SQ * 0.32, c.y + SQ * 0.45, 13.0, col, true);
+            let c = self.sq_pos(r);
+            self.text(&r.rank().char().to_string(), c.x - SQ * 0.46, c.y - SQ * 0.3, 13.0, col, true);
+        }
+    }
+
+    fn draw_world(&self, wm: Vec2) {
+        self.draw_board();
+        let moving: Vec<Square> = self.anim.iter().flat_map(|a| a.slides.iter().map(|s| s.dest)).collect();
+        for (sq, p) in self.pos.board().iter() {
+            if moving.contains(&sq) {
+                continue;
+            }
+            let dragged = self.dragging && self.sel == Some(sq);
+            let h = self.hover_amt[sq as usize];
+            let c = self.sq_pos(sq) - vec2(0.0, 4.0 * h);
+            self.draw_piece(p, c, 1.0 + 0.07 * h, if dragged { 0.3 } else { 1.0 });
+        }
+        // legal move dots, popping in staggered by distance
+        if let Some(s) = self.sel.filter(|_| self.anim.is_none()) {
+            for m in self.pos.legal_moves().iter().filter(|m| m.from() == Some(s) && matches!(m.promotion(), None | Some(Role::Queen))) {
+                let to = ui_to(m);
+                let c = self.sq_pos(to);
+                let delay = s.distance(to) as f32 * 0.035;
+                let pop = ease_out_back(((self.sel_t - delay) * 6.0).clamp(0.0, 1.0));
+                let col = Color::new(0.08, 0.1, 0.12, 0.28);
+                if m.is_capture() {
+                    draw_circle_lines(c.x, c.y, SQ * 0.44 * pop, 6.0, col);
+                } else {
+                    draw_circle(c.x, c.y, SQ * 0.15 * pop, col);
+                }
+            }
+        }
+        if let Some(a) = &self.anim {
+            let t = a.t.clamp(0.0, 1.0);
+            let e = 1.0 - (1.0 - t).powi(3);
+            if let Some((p, at)) = a.ghost {
+                self.draw_piece(p, at, 1.0 - 0.3 * t, 1.0 - t * t);
+            }
+            for s in &a.slides {
+                let lift = if a.fx { (t * PI).sin() * 0.14 } else { 0.0 };
+                self.draw_piece(s.piece, s.from.lerp(s.to, e) - vec2(0.0, lift * 30.0), 1.0 + lift, 1.0);
+            }
+        }
+        if self.dragging {
+            if let Some(p) = self.sel.and_then(|s| self.pos.board().piece_at(s)) {
+                self.draw_piece(p, wm, 1.18, 1.0);
+            }
+        }
+        if let Some((sq, g, t)) = self.badge {
+            self.draw_badge(sq, g, t);
+        }
+        self.draw_particles(false);
+        for t in &self.toasts {
+            let pop = ease_out_back((t.t * 5.0).min(1.0));
+            let a = (1.6 - t.t).min(0.4) / 0.4;
+            let c = t.p - vec2(0.0, t.t * 30.0);
+            for i in 0..8 {
+                let o = vec2((i as f32 * PI / 4.0).cos(), (i as f32 * PI / 4.0).sin()) * 2.0;
+                self.text_c(&t.text, c + o, 30.0 * pop, Color::new(0.0, 0.0, 0.0, 0.8 * a), true);
+            }
+            self.text_c(&t.text, c, 30.0 * pop, with_a(t.col, a), true);
+        }
+    }
+
+    fn draw_badge(&self, sq: Square, g: Grade, t: f32) {
+        let col = grade_color(g);
+        let c = self.sq_pos(sq);
+        if matches!(g, Grade::Blunder | Grade::Mistake) {
+            let flash = (1.0 - t * 1.5).max(0.0);
+            draw_rectangle(c.x - SQ / 2.0, c.y - SQ / 2.0, SQ, SQ, with_a(col, 0.55 * flash));
+        }
+        if matches!(g, Grade::Brilliant | Grade::Great) {
+            // expanding shockwave rings
+            for i in 0..3 {
+                let k = (t * 1.4 - i as f32 * 0.18).clamp(0.0, 1.0);
+                if k > 0.0 && k < 1.0 {
+                    draw_circle_lines(c.x, c.y, SQ * (0.3 + 1.2 * k), 4.0 * (1.0 - k), with_a(col, 1.0 - k));
+                }
+            }
+        }
+        let pop = ease_out_back((t * 4.0).min(1.0));
+        let wob = if g == Grade::Blunder { (t * 40.0).sin() * (-t * 4.0).exp() * 5.0 } else { 0.0 };
+        let p = c + vec2(SQ * 0.36 + wob, -SQ * 0.36);
+        let r = 15.0 * pop * (1.0 + 0.08 * (get_time() as f32 * 5.0).sin() * (g == Grade::Brilliant) as u8 as f32);
+        draw_circle(p.x + 1.5, p.y + 2.5, r, Color::new(0.0, 0.0, 0.0, 0.35));
+        draw_circle(p.x, p.y, r + 2.0, WHITE);
+        draw_circle(p.x, p.y, r, col);
+        if pop > 0.05 {
+            self.text_c(g.label().0, p, 17.0 * pop, WHITE, true);
+        }
+    }
+
+    fn draw_particles(&self, screen: bool) {
+        for p in self.parts.iter().filter(|p| p.screen == screen) {
+            let k = p.life / p.max;
+            if p.g > 0.0 {
+                draw_poly(p.p.x, p.p.y, 4, p.size, p.life * 400.0, with_a(p.col, k.min(1.0)));
+            } else {
+                draw_circle(p.p.x, p.p.y, p.size * k, with_a(p.col, p.col.a * k));
+            }
+        }
+    }
+
+    fn button(&self, r: Rect, label: &str) -> bool {
+        let m: Vec2 = mouse_position().into();
+        let hov = r.contains(m);
+        let down = hov && is_mouse_button_down(MouseButton::Left);
+        let off = if down { 2.0 } else { 0.0 };
+        let col = if hov { Color::from_rgba(70, 70, 90, 255) } else { Color::from_rgba(50, 50, 64, 255) };
+        draw_rectangle(r.x, r.y + 3.0, r.w, r.h, Color::new(0.0, 0.0, 0.0, 0.3));
+        draw_rectangle(r.x, r.y + off, r.w, r.h, col);
+        self.text_c(label, r.center() + vec2(0.0, off), 18.0, WHITE, true);
+        hov && is_mouse_button_pressed(MouseButton::Left)
+    }
+
+    fn draw_panel(&mut self) {
+        let (sw, sh) = (screen_width(), screen_height());
+        let time = get_time() as f32;
+        let x0 = sw - PANEL;
+        draw_rectangle(x0, 0.0, PANEL, sh, Color::from_rgba(28, 28, 36, 255));
+        draw_rectangle(x0, 0.0, 2.0, sh, Color::from_rgba(50, 50, 64, 255));
+
+        let e = self.elo_disp.clamp(1.0, MAGNUS);
+        let col = elo_color(e);
+        let magnus = self.tier == TIERS.len() - 1;
+        let d = self.text("OPPONENT", x0 + 30.0, 44.0, 16.0, GRAY, true);
+        let mood = format!("{:?}", self.mood).to_uppercase();
+        self.text(&format!("·  {mood}"), x0 + 40.0 + d.width, 44.0, 16.0, mood_color(self.mood), true);
+        let pop = 1.0 + 0.35 * ease_out_back(self.tier_pop) * self.tier_pop + 0.06 * self.tick_pop;
+        let num_col = if magnus { Color::new(1.0, 0.8 + 0.15 * (time * 6.0).sin(), 0.25, 1.0) } else { col };
+        let d = self.text(&format!("{:.0}", e), x0 + 30.0, 108.0, 60.0 * pop, num_col, true);
+        self.text("ELO", x0 + 40.0 + d.width, 108.0, 18.0, GRAY, true);
+        self.text(TIERS[self.tier].1, x0 + 30.0, 145.0, 24.0 * (1.0 + 0.2 * self.tier_pop), col, true);
+
+        // the bar
+        let b = self.bar_rect();
+        let r = b.w / 2.0;
+        let track = Color::from_rgba(45, 45, 58, 255);
+        draw_rectangle(b.x, b.y, b.w, b.h, track);
+        draw_circle(b.x + r, b.y, r, track);
+        draw_circle(b.x + r, b.y + b.h, r, track);
+        let ky = self.knob_y().clamp(b.y, b.y + b.h);
+        draw_rectangle(b.x - 6.0, ky, b.w + 12.0, b.y + b.h - ky, with_a(col, 0.12 + 0.08 * self.tier_pop));
+        draw_circle(b.x + r, b.y + b.h, r, elo_color(1.0));
+        let n = 90;
+        for i in 0..n {
+            let y1 = b.y + b.h * (1.0 - i as f32 / n as f32);
+            let y0 = b.y + b.h * (1.0 - (i + 1) as f32 / n as f32);
+            if y1 <= ky {
+                break;
+            }
+            let c = elo_color(1.0 + (MAGNUS - 1.0) * i as f32 / n as f32);
+            let shim = 0.18 * ((time * 3.0 + y0 * 0.04).sin()).max(0.0).powi(4);
+            let c = Color::new((c.r + shim).min(1.0), (c.g + shim).min(1.0), (c.b + shim).min(1.0), 1.0);
+            draw_rectangle(b.x, y0.max(ky), b.w, y1 - y0.max(ky), c);
+        }
+        // tier ladder
+        for (i, t) in TIERS.iter().enumerate().skip(1) {
+            let y = b.y + b.h * (1.0 - (t.0 - 1.0) / (MAGNUS - 1.0));
+            let reached = e >= t.0;
+            let c = if reached { elo_color(t.0) } else { Color::from_rgba(90, 90, 105, 255) };
+            draw_line(b.x + b.w + 6.0, y, b.x + b.w + 18.0, y, 2.0, c);
+            let wob = if i == self.tier { 4.0 * self.tier_pop } else { 0.0 };
+            self.text(t.1, b.x + b.w + 26.0 + wob, y + 5.0, if i == self.tier { 17.0 } else { 14.0 }, c, i == self.tier);
+            self.text(&format!("{:.0}", t.0), b.x + b.w + 212.0, y + 5.0, 12.0, with_a(c, 0.6), false);
+        }
+        // crown
+        let crown = vec2(b.x + r, b.y - 42.0);
+        if magnus {
+            for i in 0..6 {
+                draw_circle(crown.x, crown.y, 34.0 * (1.0 - i as f32 / 7.0) * (0.9 + 0.1 * (time * 5.0).sin()), Color::new(1.0, 0.8, 0.2, 0.08));
+            }
+        }
+        let cc = if magnus { GOLD } else { Color::from_rgba(80, 80, 95, 255) };
+        self.draw_crown(crown, 1.0 + 0.25 * self.tier_pop * magnus as u8 as f32, cc);
+
+        // knob: squash/stretch with velocity, pops on every 100 and harder on tier change
+        let speed = (self.elo_vel.abs() / 4000.0).min(0.5);
+        let m: Vec2 = mouse_position().into();
+        let near = (m - vec2(b.x + r, self.knob_y())).length() < 40.0 || self.elo_drag;
+        let kr = 19.0 * (1.0 + 0.18 * self.tick_pop + 0.4 * self.tier_pop + if near { 0.12 } else { 0.0 });
+        let kp = vec2(b.x + r, self.knob_y());
+        for i in 0..5 {
+            draw_circle(kp.x, kp.y, kr * (1.6 - i as f32 * 0.12), with_a(col, 0.06));
+        }
+        draw_ellipse(kp.x, kp.y, kr * (1.0 - speed * 0.4), kr * (1.0 + speed), 0.0, WHITE);
+        draw_ellipse(kp.x, kp.y, kr * 0.62 * (1.0 - speed * 0.4), kr * 0.62 * (1.0 + speed), 0.0, col);
+        self.draw_particles(true);
+
+        // buttons
+        let bw = PANEL - 60.0;
+        let by = sh - 210.0;
+        if self.button(Rect::new(x0 + 30.0, by - 54.0, bw, 44.0), &format!("Clock: {}  (new game)", TCS[self.tc].0)) {
+            self.tc = (self.tc + 1) % TCS.len();
+            self.new_game(self.player);
+        }
+        if self.button(Rect::new(x0 + 30.0, by, bw / 2.0 - 5.0, 44.0), "Play White") {
+            self.new_game(Side::White);
+        }
+        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by, bw / 2.0 - 5.0, 44.0), "Play Black") {
+            self.new_game(Side::Black);
+        }
+        if self.button(Rect::new(x0 + 30.0, by + 54.0, bw / 2.0 - 5.0, 44.0), "Undo") {
+            self.undo();
+        }
+        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by + 54.0, bw / 2.0 - 5.0, 44.0), "Overlay") {
+            self.relaunch(true);
+        }
+        let status = if self.over() {
+            match self.winner() {
+                Some(w) if w == self.player => "You won!".to_string(),
+                Some(_) => "You lost.".to_string(),
+                None => "Draw.".to_string(),
+            }
+        } else if self.pos.turn() == self.player {
+            "Your move".to_string()
+        } else {
+            format!("Thinking{}", ".".repeat((time * 3.0) as usize % 4))
+        };
+        self.text(&status, x0 + 30.0, by + 140.0, 22.0, WHITE, true);
+        self.text("wheel: zoom   right-drag: pan   R: reset", x0 + 30.0, sh - 30.0, 13.0, GRAY, false);
+        self.text("up/down or scroll here: ELO", x0 + 30.0, sh - 12.0, 13.0, GRAY, false);
+    }
+
+    fn draw_crown(&self, c: Vec2, s: f32, col: Color) {
+        let w = 26.0 * s;
+        let h = 18.0 * s;
+        let base = c.y + h / 2.0;
+        let pts = [-w, -w * 0.5, 0.0, w * 0.5, w];
+        for (i, x) in pts.iter().enumerate() {
+            let tip = if i % 2 == 0 { c.y - h } else { c.y - h * 0.3 };
+            draw_triangle(vec2(c.x + x, tip), vec2(c.x + x - w * 0.35, base), vec2(c.x + x + w * 0.35, base), col);
+            if i % 2 == 0 {
+                draw_circle(c.x + x, tip, 3.5 * s, col);
+            }
+        }
+        draw_rectangle(c.x - w, base, w * 2.0, 6.0 * s, col);
+    }
+
+    fn draw_game_over(&self) {
+        if !self.over() || self.over_t <= 0.0 {
+            return;
+        }
+        let (sw, sh) = (screen_width(), screen_height());
+        let a = (self.over_t * 3.0).min(1.0);
+        let pop = ease_out_back((self.over_t * 3.0).min(1.0));
+        let cx = (sw - self.panel_w()) / 2.0;
+        let sh = sh - self.strip_h();
+        draw_rectangle(0.0, sh / 2.0 - 60.0 * pop, sw - self.panel_w(), 120.0 * pop, Color::new(0.0, 0.0, 0.0, 0.55 * a));
+        let on_time = self.flagged().is_some();
+        let (title, sub) = match self.winner() {
+            Some(w) if w == self.player && on_time => ("ON TIME!", format!("The {:.0} ELO {} flagged", self.elo, TIERS[tier(self.elo)].1)),
+            Some(_) if on_time => ("Flagged", "Out of time. Move faster!".to_string()),
+            Some(w) if w == self.player => ("CHECKMATE!", format!("You beat the {:.0} ELO {}", self.elo, TIERS[tier(self.elo)].1)),
+            Some(_) => ("Checkmated", format!("{} ({:.0}) got you. Undo?", TIERS[tier(self.elo)].1, self.elo)),
+            None => ("Draw", "Nobody wins.".to_string()),
+        };
+        self.text_c(title, vec2(cx, sh / 2.0 - 14.0), 54.0 * pop, with_a(WHITE, a), true);
+        self.text_c(&sub, vec2(cx, sh / 2.0 + 34.0), 20.0 * pop, with_a(LIGHTGRAY, a), false);
+    }
+
+    /// Overlay mode's compact controls: grip | - ELO + | status | undo | new | exit.
+    fn draw_strip(&mut self) {
+        let (sw, sh) = (screen_width(), screen_height());
+        let y = sh - STRIP;
+        draw_rectangle(0.0, y, sw, STRIP, Color::new(0.11, 0.11, 0.14, 0.85));
+        for i in 0..6 {
+            draw_circle(14.0 + (i % 2) as f32 * 8.0, y + 16.0 + (i / 2) as f32 * 9.0, 2.2, GRAY); // grip
+        }
+        let e = self.elo_disp.clamp(1.0, MAGNUS);
+        let b = |x: f32, w: f32| Rect::new(x, y + 10.0, w, STRIP - 20.0);
+        if self.button(b(40.0, 30.0), "-") {
+            self.elo = (self.elo - 100.0).max(1.0);
+        }
+        let pop = 1.0 + 0.3 * self.tier_pop + 0.06 * self.tick_pop;
+        self.text_c(&format!("{:.0}", e), vec2(105.0, y + 22.0), 24.0 * pop, elo_color(e), true);
+        let short = TIERS[self.tier].1.split(' ').next().unwrap_or_default();
+        self.text_c(short, vec2(105.0, y + 43.0), 10.0, elo_color(e), true);
+        if self.button(b(140.0, 30.0), "+") {
+            self.elo = (self.elo + 100.0).min(MAGNUS);
+        }
+        let status = if self.over() {
+            "Game over".to_string()
+        } else if self.tc > 0 {
+            format!("{}  vs  {}", Self::fmt_clock(self.clock[self.player as usize]), Self::fmt_clock(self.clock[!self.player as usize]))
+        } else if self.pos.turn() == self.player {
+            "Your move".to_string()
+        } else {
+            "Thinking…".to_string()
+        };
+        self.text(&status, 182.0, y + 34.0, 14.0, LIGHTGRAY, true);
+        if self.button(b(sw - 178.0, 56.0), "Undo") {
+            self.undo();
+        }
+        if self.button(b(sw - 116.0, 50.0), "New") {
+            self.new_game(self.player);
+        }
+        if self.button(b(sw - 60.0, 50.0), "Exit") {
+            self.relaunch(false);
+        }
+        self.draw_particles(true);
+    }
+
+    fn draw_clocks(&self) {
+        if self.tc == 0 || self.overlay.is_some() {
+            return;
+        }
+        let time = get_time() as f32;
+        let sh = screen_height();
+        let x = (screen_width() - PANEL) / 2.0 + (sh * 0.86) / 2.0 - 130.0;
+        for (side, y) in [(!self.player, 3.0), (self.player, sh - 37.0)] {
+            let t = self.clock[side as usize];
+            let active = self.pos.turn() == side && !self.over();
+            let low = t < 20.0;
+            let pulse = if low && active { 0.5 + 0.5 * (time * 10.0).sin() } else { 0.0 };
+            let shake = if side != self.player && self.mood == ai::Mood::Hurrying { (time * 50.0).sin() * 2.0 } else { 0.0 };
+            let bg = if active { Color::new(0.95, 0.95, 0.92, 1.0) } else { Color::new(0.2, 0.2, 0.25, 1.0) };
+            let bg = if low && active { Color::new(1.0, 0.35 + 0.3 * (1.0 - pulse), 0.3 + 0.3 * (1.0 - pulse), 1.0) } else { bg };
+            draw_rectangle(x + shake, y, 130.0, 34.0, bg);
+            let fg = if active { BLACK } else { LIGHTGRAY };
+            self.text_c(&Self::fmt_clock(t), vec2(x + 65.0 + shake, y + 17.0), 21.0 * (1.0 + 0.08 * pulse), fg, true);
+        }
+    }
+
+    fn draw(&mut self) {
+        clear_background(if self.overlay.is_some() { overlay::CLEAR } else { Color::from_rgba(20, 20, 26, 255) });
+        let cam = self.camera(true);
+        let wm = cam.screen_to_world(mouse_position().into());
+        set_camera(&cam);
+        self.draw_world(wm);
+        set_default_camera();
+        self.draw_clocks();
+        self.draw_game_over();
+        if self.overlay.is_some() {
+            self.draw_strip();
+        } else {
+            self.draw_panel();
+        }
+    }
+}
+
+fn arg(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+fn overlay_mode() -> bool {
+    std::env::args().any(|a| a == "--overlay")
+}
+
+fn conf() -> Conf {
+    let mut c = Conf { window_title: "Fun Chess".into(), window_width: 1280, window_height: 820, sample_count: 4, ..Default::default() };
+    if overlay_mode() {
+        c.window_title = overlay::TITLE.into();
+        c.window_width = 520;
+        c.window_height = 560;
+        c.window_resizable = false;
+        c.platform.framebuffer_alpha = true;
+        c.platform.linux_wm_class = overlay::WM_CLASS;
+    }
+    c
+}
+
+#[macroquad::main(conf)]
+async fn main() {
+    let font = load_ttf_font_from_bytes(include_bytes!("../assets/DejaVuSans.ttf")).unwrap();
+    let bold = load_ttf_font_from_bytes(include_bytes!("../assets/DejaVuSans-Bold.ttf")).unwrap();
+    let engine = match ai::spawn() {
+        Ok(e) => e,
+        Err(e) => loop {
+            clear_background(BLACK);
+            draw_text_ex(&e, 20.0, 40.0, TextParams { font: Some(&font), font_size: 20, color: WHITE, ..Default::default() });
+            next_frame().await;
+        },
+    };
+    rand::srand(miniquad::date::now().to_bits());
+    let pos = arg("--fen")
+        .and_then(|f| f.parse::<shakmaty::fen::Fen>().ok()?.into_position(shakmaty::CastlingMode::Standard).ok())
+        .unwrap_or_default();
+    let player = if arg("--side").as_deref() == Some("b") { Side::Black } else { Side::White };
+    let tc = arg("--tc").and_then(|t| t.parse().ok()).filter(|&t: &usize| t < TCS.len()).unwrap_or(0);
+    let clock = arg("--clock")
+        .and_then(|c| {
+            let (b, w) = c.split_once(',')?;
+            Some([b.parse().ok()?, w.parse().ok()?])
+        })
+        .unwrap_or([TCS[tc].1; 2]);
+    let elo = arg("--elo").and_then(|e| e.parse().ok()).unwrap_or(1200.0f32).clamp(1.0, MAGNUS);
+    let mut app = App {
+        pos,
+        history: vec![],
+        last: None,
+        player,
+        sel: None,
+        sel_t: 0.0,
+        dragging: false,
+        hover_amt: [0.0; 64],
+        anim: None,
+        parts: vec![],
+        toasts: vec![],
+        zoom: 0.6,
+        zoom_to: 1.0,
+        center: vec2(BOARD / 2.0, BOARD / 2.0),
+        center_to: vec2(BOARD / 2.0, BOARD / 2.0),
+        shake: 0.0,
+        punch: 0.0,
+        pan_last: None,
+        elo,
+        elo_disp: 0.0,
+        elo_vel: 0.0,
+        elo_drag: false,
+        tier: 0,
+        tier_pop: 0.0,
+        tick_pop: 0.0,
+        game_id: 0,
+        waiting: false,
+        think_start: 0.0,
+        pending: None,
+        over_t: 0.0,
+        engine,
+        tc,
+        clock,
+        mood: ai::Mood::Calm,
+        overlay: overlay_mode().then(overlay::Overlay::default),
+        analysis: None,
+        analysed: None,
+        want_grade: None,
+        badge: None,
+        win_drag: None,
+        font,
+        bold,
+    };
+    loop {
+        app.update();
+        app.draw();
+        next_frame().await;
+    }
+}
