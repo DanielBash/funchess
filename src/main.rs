@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod ai;
+mod book;
 mod overlay;
 
 use ai::{Grade, MAGNUS};
@@ -12,6 +13,24 @@ const SQ: f32 = 80.0;
 const BOARD: f32 = SQ * 8.0;
 const PANEL: f32 = 340.0;
 const STRIP: f32 = 56.0;
+/// Practice lines: the bot sticks to these while you do, then continues like real players would.
+const OPENINGS: [(&str, &str); 14] = [
+    ("Any (bots play like humans)", ""),
+    ("Italian Game", "e4 e5 Nf3 Nc6 Bc4"),
+    ("Ruy Lopez", "e4 e5 Nf3 Nc6 Bb5"),
+    ("Sicilian Defense", "e4 c5"),
+    ("French Defense", "e4 e6"),
+    ("Caro-Kann Defense", "e4 c6"),
+    ("Scandinavian Defense", "e4 d5"),
+    ("Queen's Gambit", "d4 d5 c4"),
+    ("London System", "d4 d5 Bf4"),
+    ("King's Indian Defense", "d4 Nf6 c4 g6"),
+    ("Trap: Fried Liver Attack", "e4 e5 Nf3 Nc6 Bc4 Nf6 Ng5 d5 exd5 Nxd5"),
+    ("Trap: Stafford Gambit", "e4 e5 Nf3 Nf6 Nxe5 Nc6"),
+    ("Trap: Scholar's Mate try", "e4 e5 Qh5 Nc6 Bc4"),
+    ("Trap: Englund Gambit", "d4 e5 dxe5 Nc6 Nf3 Qe7"),
+];
+
 /// (label, base seconds, increment)
 const TCS: [(&str, f32, f32); 5] = [("No clock", 0.0, 0.0), ("1+0", 60.0, 0.0), ("3+2", 180.0, 2.0), ("5+0", 300.0, 0.0), ("10+0", 600.0, 0.0)];
 
@@ -43,6 +62,7 @@ fn grade_color(g: Grade) -> Color {
     match g {
         Grade::Brilliant => Color::new(0.1, 0.8, 0.8, 1.0),
         Grade::Great => Color::new(0.35, 0.55, 1.0, 1.0),
+        Grade::Book => Color::new(0.68, 0.53, 0.38, 1.0),
         Grade::Best => Color::new(0.45, 0.75, 0.2, 1.0),
         Grade::Excellent => Color::new(0.5, 0.8, 0.35, 1.0),
         Grade::Good => Color::new(0.55, 0.7, 0.5, 1.0),
@@ -110,7 +130,7 @@ struct Anim {
     t: f32,
     ghost: Option<(Piece, Vec2)>,
     fx: bool,
-    tag: Option<&'static str>,
+    tag: Option<String>,
 }
 
 struct App {
@@ -142,9 +162,13 @@ struct App {
     game_id: u64,
     waiting: bool,
     think_start: f64,
-    pending: Option<(Move, Option<&'static str>, f64)>,
+    pending: Option<(Move, Option<String>, f64)>,
     over_t: f32,
     engine: ai::Engine,
+    played: Vec<Move>,
+    opening: usize,
+    opening_name: Option<(String, f32)>,
+    real_game: Option<(String, String)>,
     tc: usize,
     clock: [f32; 2], // indexed by Side as usize: black 0, white 1
     mood: ai::Mood,
@@ -163,9 +187,25 @@ impl App {
         self.pos = Chess::default();
         self.history.clear();
         self.player = side;
+        self.played.clear();
+        self.opening_name = None;
+        self.real_game = None;
         self.clock = [TCS[self.tc].1; 2];
         self.mood = ai::Mood::Calm;
         self.reset_turn_state();
+    }
+
+    /// Next move of the chosen practice line, if the game is still on it.
+    fn line_move(&self) -> Option<Move> {
+        let mut pos = Chess::default();
+        let mut line = vec![];
+        for t in OPENINGS[self.opening].1.split_whitespace() {
+            let m = t.parse::<shakmaty::san::San>().ok()?.to_move(&pos).ok()?;
+            pos.play_unchecked(m);
+            line.push(m);
+        }
+        let n = self.played.len();
+        (n < line.len() && *self.history.first().unwrap_or(&self.pos) == Chess::default() && line[..n] == self.played[..]).then(|| line[n])
     }
 
     fn flagged(&self) -> Option<Side> {
@@ -218,6 +258,7 @@ impl App {
         let mut args = vec!["--fen".to_string(), fen, "--side".into(), (if self.player == Side::White { "w" } else { "b" }).into()];
         args.extend(["--elo".into(), format!("{:.0}", self.elo), "--tc".into(), self.tc.to_string()]);
         args.extend(["--clock".into(), format!("{},{}", self.clock[0], self.clock[1])]);
+        args.extend(["--opening".into(), self.opening.to_string()]);
         if overlay {
             args.push("--overlay".into());
         }
@@ -234,12 +275,25 @@ impl App {
             return;
         }
         let (sq, grade) = (*sq, ai::classify(before, lines, *m));
+        // a sound move that lots of real players play here = book
+        let pop = ai::book().all(book::key(before));
+        let total: u32 = pop.iter().map(|b| b.count).sum();
+        let share = pop.iter().find(|b| b.mv == book::encode(*m)).map_or(0.0, |b| b.count as f32 / total as f32);
+        let grade = grade.map(|g| match g {
+            Grade::Great | Grade::Best | Grade::Excellent | Grade::Good if share >= 0.03 && total >= 50 => Grade::Book,
+            g => g,
+        });
         self.want_grade = None;
         let Some(g) = grade else { return };
         self.badge = Some((sq, g, 0.0));
         let c = self.sq_pos(sq);
         let col = grade_color(g);
-        self.toast(g.label().1, c - vec2(0.0, 46.0), col);
+        let label = match g {
+            Grade::Book => format!("Book · {:.0}% play this", share * 100.0),
+            _ if share > 0.0 && total >= 50 => format!("{} · {:.0}% play this", g.label().1, share * 100.0),
+            _ => g.label().1.to_string(),
+        };
+        self.toast(&label, c - vec2(0.0, 46.0), col);
         match g {
             Grade::Brilliant => {
                 self.burst(c, col, 60, 340.0, false);
@@ -263,6 +317,7 @@ impl App {
     fn undo(&mut self) {
         while let Some(p) = self.history.pop() {
             self.pos = p;
+            self.played.pop();
             if self.pos.turn() == self.player {
                 break;
             }
@@ -310,7 +365,7 @@ impl App {
     }
 
     fn bar_rect(&self) -> Rect {
-        Rect::new(screen_width() - PANEL + 50.0, 225.0, 34.0, screen_height() - 225.0 - 300.0)
+        Rect::new(screen_width() - PANEL + 50.0, 225.0, 34.0, screen_height() - 225.0 - 355.0)
     }
 
     fn knob_y(&self) -> f32 {
@@ -349,7 +404,7 @@ impl App {
         self.toasts.push(Toast { text: text.into(), p, t: 0.0, col });
     }
 
-    fn play(&mut self, m: Move, start: Option<Vec2>, tag: Option<&'static str>) {
+    fn play(&mut self, m: Move, start: Option<Vec2>, tag: Option<String>) {
         let from = m.from().unwrap();
         let to = ui_to(&m);
         let mover = self.pos.turn();
@@ -370,6 +425,7 @@ impl App {
             }
         }
         self.history.push(self.pos.clone());
+        self.played.push(m);
         self.pos.play_unchecked(m);
 
         let mut slides = vec![Slide {
@@ -393,6 +449,19 @@ impl App {
         if !a.fx {
             return;
         }
+        let ph = book::phase(&self.pos, self.played.len());
+        if ph >= 2 && book::phase(self.history.last().unwrap_or(&self.pos), self.played.len().saturating_sub(1)) != ph {
+            let band = book::band(self.elo);
+            let label = match ai::book().slip_rate(band, ph) {
+                Some(r) => format!("{} · {} players slip on {:.0}% of moves here", book::PHASES[ph], book::band_label(band), r * 100.0),
+                None => book::PHASES[ph].to_string(),
+            };
+            self.opening_name = Some((label, 0.0));
+        } else if let Some(name) = ai::book().names.get(&book::key(&self.pos)) {
+            if self.opening_name.as_ref().is_none_or(|(n, _)| n != name) {
+                self.opening_name = Some((name.clone(), 0.0));
+            }
+        }
         let dest = a.slides[0].to;
         if let Some((p, at)) = a.ghost {
             let col = if p.color.is_white() { Color::new(0.98, 0.95, 0.88, 1.0) } else { Color::new(0.15, 0.15, 0.2, 1.0) };
@@ -403,7 +472,7 @@ impl App {
         } else {
             self.burst(dest, Color::new(1.0, 1.0, 1.0, 0.5), 6, 70.0, false);
         }
-        if let Some(t) = a.tag {
+        if let Some(t) = &a.tag {
             self.toast(t, dest - vec2(0.0, 40.0), elo_color(self.elo));
         }
         if self.pos.is_checkmate() {
@@ -519,6 +588,9 @@ impl App {
         }
         self.toasts.retain(|t| t.t < 1.6);
         self.sel_t += dt;
+        if let Some(o) = &mut self.opening_name {
+            o.1 += dt;
+        }
         if let Some(b) = &mut self.badge {
             b.2 += dt;
         }
@@ -569,6 +641,11 @@ impl App {
 
         // --- AI ---
         if !over && self.pos.turn() != self.player && self.anim.is_none() && !self.waiting && self.pending.is_none() {
+            if let Some(m) = self.line_move() {
+                self.pending = Some((m, None, get_time() + gen_range(0.4, 1.0)));
+            }
+        }
+        if !over && self.pos.turn() != self.player && self.anim.is_none() && !self.waiting && self.pending.is_none() {
             let clock = (self.tc > 0).then(|| self.clock[!self.player as usize]);
             let req = ai::Req::Think { game_id: self.game_id, pos: self.pos.clone(), elo: self.elo, clock };
             if self.engine.tx.send(req).is_ok() {
@@ -580,11 +657,20 @@ impl App {
         let key = (self.game_id, self.history.len());
         if !over && self.pos.turn() == self.player && self.analysed != Some(key) {
             self.analysed = Some(key);
+            let pop = ai::book().all(book::key(&self.pos));
+            let total: u32 = pop.iter().map(|b| b.count).sum();
+            if let Some(top) = pop.first().filter(|t| total >= 100 && t.count * 4 >= total && t.score() < 0.4) {
+                let msg = format!("Trap! {:.0}% of players go wrong here", 100.0 * top.count as f32 / total as f32);
+                self.toast(&msg, vec2(BOARD / 2.0, BOARD / 2.0), Color::new(1.0, 0.5, 0.3, 1.0));
+            }
             let _ = self.engine.tx.send(ai::Req::Analyse { game_id: key.0, ply: key.1, pos: self.pos.clone() });
         }
         while let Ok(r) = self.engine.rx.try_recv() {
             match r {
-                ai::Reply::Move { game_id, mv, tag, mood } if game_id == self.game_id => {
+                ai::Reply::Move { game_id, mv, tag, mood, real } if game_id == self.game_id => {
+                    if real.is_some() {
+                        self.real_game = real;
+                    }
                     self.waiting = false;
                     if mood != self.mood && mood != ai::Mood::Calm {
                         if let Some(k) = self.pos.board().king_of(!self.player) {
@@ -613,7 +699,7 @@ impl App {
                 _ => {}
             }
         }
-        if let Some((m, tag, at)) = self.pending {
+        if let Some((m, tag, at)) = self.pending.clone() {
             if get_time() >= at && self.anim.is_none() {
                 self.pending = None;
                 self.play(m, None, tag);
@@ -796,6 +882,14 @@ impl App {
                 self.draw_piece(p, wm, 1.18, 1.0);
             }
         }
+        if let Some(m) = self.line_move().filter(|_| self.pos.turn() == self.player && self.anim.is_none()) {
+            // practice line: show the move you're drilling
+            let pulse = 0.5 + 0.5 * (get_time() as f32 * 4.0).sin();
+            for s in [m.from().unwrap(), ui_to(&m)] {
+                let c = self.sq_pos(s);
+                draw_rectangle_lines(c.x - SQ / 2.0 + 3.0, c.y - SQ / 2.0 + 3.0, SQ - 6.0, SQ - 6.0, 6.0, Color::new(0.3, 0.9, 0.5, 0.4 + 0.5 * pulse));
+            }
+        }
         if let Some((sq, g, t)) = self.badge {
             self.draw_badge(sq, g, t);
         }
@@ -859,7 +953,8 @@ impl App {
         let col = if hov { Color::from_rgba(70, 70, 90, 255) } else { Color::from_rgba(50, 50, 64, 255) };
         draw_rectangle(r.x, r.y + 3.0, r.w, r.h, Color::new(0.0, 0.0, 0.0, 0.3));
         draw_rectangle(r.x, r.y + off, r.w, r.h, col);
-        self.text_c(label, r.center() + vec2(0.0, off), 18.0, WHITE, true);
+        let w = measure_text(label, Some(&self.bold), 64, 18.0 / 64.0).width;
+        self.text_c(label, r.center() + vec2(0.0, off), 18.0 * ((r.w - 16.0) / w).min(1.0), WHITE, true);
         hov && is_mouse_button_pressed(MouseButton::Left)
     }
 
@@ -940,6 +1035,10 @@ impl App {
         // buttons
         let bw = PANEL - 60.0;
         let by = sh - 210.0;
+        if self.button(Rect::new(x0 + 30.0, by - 108.0, bw, 44.0), &format!("Practice: {}", OPENINGS[self.opening].0)) {
+            self.opening = (self.opening + 1) % OPENINGS.len();
+            self.new_game(self.player);
+        }
         if self.button(Rect::new(x0 + 30.0, by - 54.0, bw, 44.0), &format!("Clock: {}  (new game)", TCS[self.tc].0)) {
             self.tc = (self.tc + 1) % TCS.len();
             self.new_game(self.player);
@@ -969,7 +1068,8 @@ impl App {
         };
         self.text(&status, x0 + 30.0, by + 140.0, 22.0, WHITE, true);
         self.text("wheel: zoom   right-drag: pan   R: reset", x0 + 30.0, sh - 30.0, 13.0, GRAY, false);
-        self.text("up/down or scroll here: ELO", x0 + 30.0, sh - 12.0, 13.0, GRAY, false);
+        let games = ai::book().games as f32 / 1e6;
+        self.text(&format!("scroll here: ELO · learned from {games:.1}M Lichess games"), x0 + 30.0, sh - 12.0, 12.0, GRAY, false);
     }
 
     fn draw_crown(&self, c: Vec2, s: f32, col: Color) {
@@ -1080,6 +1180,20 @@ impl App {
         self.draw_world(wm);
         set_default_camera();
         self.draw_clocks();
+        if let (Some((name, t)), None) = (&self.opening_name, &self.overlay) {
+            let k = (t * 3.0).min(1.0);
+            self.text(name, 20.0 - 20.0 * (1.0 - k), 28.0, 17.0, with_a(Color::new(0.85, 0.75, 0.55, 1.0), k), true);
+        }
+        if let (Some((url, who)), None) = (&self.real_game, &self.overlay) {
+            let label = format!("Bot is replaying a real game ({who}) · {} ↗", url.trim_start_matches("https://"));
+            let d = measure_text(&label, Some(&self.font), 64, 14.0 / 64.0);
+            let r = Rect::new(20.0, 38.0, d.width, 20.0);
+            let hov = r.contains(mouse_position().into());
+            self.text(&label, 20.0, 52.0, 14.0, if hov { Color::new(0.6, 0.85, 1.0, 1.0) } else { Color::new(0.45, 0.7, 0.95, 1.0) }, false);
+            if hov && is_mouse_button_pressed(MouseButton::Left) {
+                open_url(url);
+            }
+        }
         self.draw_game_over();
         if self.overlay.is_some() {
             self.draw_strip();
@@ -1087,6 +1201,13 @@ impl App {
             self.draw_panel();
         }
     }
+}
+
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -1168,6 +1289,10 @@ async fn main() {
         pending: None,
         over_t: 0.0,
         engine,
+        played: vec![],
+        opening: arg("--opening").and_then(|o| o.parse().ok()).filter(|&o: &usize| o < OPENINGS.len()).unwrap_or(0),
+        opening_name: None,
+        real_game: None,
         tc,
         clock,
         mood: ai::Mood::Calm,

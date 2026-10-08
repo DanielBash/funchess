@@ -1,3 +1,4 @@
+#![allow(warnings)] // vendored upstream code (see README)
 #![doc = include_str!("../README.md")]
 #![allow(
     clippy::collapsible_if,
