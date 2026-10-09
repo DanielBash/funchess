@@ -265,6 +265,8 @@ struct Particle {
 
 struct Toast {
     text: String,
+    /// smaller second line (e.g. how many players make this move)
+    sub: Option<String>,
     p: Vec2,
     t: f32,
     col: Color,
@@ -510,12 +512,8 @@ impl App {
         self.grade_shown = get_time();
         let c = self.sq_pos(sq);
         let col = grade_color(g);
-        let label = match g {
-            Grade::Book => format!("{} · {:.0}% {}", g.label().1, share * 100.0, tr("play this", "играют так")),
-            _ if share > 0.0 && total >= 50 => format!("{} · {:.0}% {}", g.label().1, share * 100.0, tr("play this", "играют так")),
-            _ => g.label().1.to_string(),
-        };
-        self.toast(&label, c - vec2(0.0, 46.0), col);
+        let sub = (share > 0.0 && total >= 50).then(|| format!("{:.0}% {}", share * 100.0, tr("play this", "играют так")));
+        self.toasts.push(Toast { text: g.label().1.into(), sub, p: c - vec2(0.0, 64.0), t: 0.0, col });
         match g {
             Grade::Brilliant => {
                 self.burst(c, col, 60, 340.0, false);
@@ -624,7 +622,7 @@ impl App {
     }
 
     fn toast(&mut self, text: &str, p: Vec2, col: Color) {
-        self.toasts.push(Toast { text: text.into(), p, t: 0.0, col });
+        self.toasts.push(Toast { text: text.into(), sub: None, p, t: 0.0, col });
     }
 
     fn play(&mut self, m: Move, start: Option<Vec2>, tag: Option<String>) {
@@ -1296,11 +1294,15 @@ impl App {
             let pop = ease_out_back((t.t * 5.0).min(1.0));
             let a = (2.6 - t.t).min(0.5) / 0.5;
             let c = t.p - vec2(0.0, t.t * 30.0);
-            for i in 0..8 {
-                let o = vec2((i as f32 * PI / 4.0).cos(), (i as f32 * PI / 4.0).sin()) * 2.0;
-                self.text_c(&t.text, c + o, 30.0 * pop, Color::new(0.0, 0.0, 0.0, 0.8 * a), true);
+            let lines = [Some((&t.text, 22.0, 0.0)), t.sub.as_ref().map(|s| (s, 14.0, 19.0))];
+            for (text, size, dy) in lines.into_iter().flatten() {
+                let at = c + vec2(0.0, dy * pop);
+                for i in 0..8 {
+                    let o = vec2((i as f32 * PI / 4.0).cos(), (i as f32 * PI / 4.0).sin()) * 1.6;
+                    self.text_c(text, at + o, size * pop, Color::new(0.0, 0.0, 0.0, 0.8 * a), true);
+                }
+                self.text_c(text, at, size * pop, with_a(t.col, a), true);
             }
-            self.text_c(&t.text, c, 30.0 * pop, with_a(t.col, a), true);
         }
     }
 
