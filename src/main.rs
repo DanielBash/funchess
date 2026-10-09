@@ -271,6 +271,15 @@ struct Anim {
     tag: Option<String>,
 }
 
+/// Settings picked from a dropdown list.
+#[derive(Clone, Copy, PartialEq)]
+enum Dd {
+    Practice,
+    Clock,
+    Skin,
+    Lang,
+}
+
 /// "From position" board editor.
 struct Editor {
     board: shakmaty::Board,
@@ -317,6 +326,8 @@ struct App {
     icons: Vec<Texture2D>,
     grass: Option<skins::Grass>,
     editor: Option<Editor>,
+    dd_open: Option<Dd>,
+    dd_menu: Option<(Dd, Rect)>,
     saved: (f32, usize, usize, bool),
     played: Vec<Move>,
     opening: usize,
@@ -706,7 +717,7 @@ impl App {
         // --- ELO slider ---
         let bar = self.bar_rect();
         let grab = Rect::new(bar.x - 40.0, bar.y - 30.0, bar.w + 80.0, bar.h + 60.0);
-        if is_mouse_button_pressed(MouseButton::Left) && grab.contains(mouse) && self.overlay.is_none() {
+        if is_mouse_button_pressed(MouseButton::Left) && grab.contains(mouse) && self.overlay.is_none() && self.dd_open.is_none() {
             self.elo_drag = true;
         }
         if !is_mouse_button_down(MouseButton::Left) {
@@ -739,8 +750,8 @@ impl App {
             self.burst(at, elo_color(self.elo_disp), n, 220.0 + t as f32 * 40.0, true);
         }
         if self.tier >= MAGNUS_TIER && self.overlay.is_none() && gen_range(0.0, 1.0) < 0.5 {
-            let at = vec2(bar.center().x + gen_range(-30.0, 30.0), bar.y - 30.0 + gen_range(-20.0, 20.0));
-            self.burst(at, GOLD, 1, 60.0, true);
+            let at = vec2(bar.center().x + gen_range(-20.0, 20.0), bar.y - 8.0 + gen_range(-12.0, 12.0));
+            self.burst(at, elo_color(self.elo_disp), 1, 60.0, true);
         }
         self.tier_pop = (self.tier_pop - dt * 2.5).max(0.0);
         self.tick_pop = (self.tick_pop - dt * 6.0).max(0.0);
@@ -848,7 +859,7 @@ impl App {
             let on = my_turn && hover.map(|s| s as usize) == Some(i) && !self.dragging;
             *h += ((on as u8 as f32) - *h) * (1.0 - (-dt * 18.0).exp());
         }
-        if my_turn && !self.elo_drag {
+        if my_turn && !self.elo_drag && self.dd_open.is_none() {
             if is_mouse_button_pressed(MouseButton::Left) && on_board_side {
                 if let Some(m) = self.sel.zip(hover).and_then(|(s, h)| self.find_move(s, h)) {
                     self.play(m, None, None);
@@ -959,7 +970,7 @@ impl App {
                 let p = (start + win + mouse - grab).max(Vec2::ZERO);
                 miniquad::window::set_window_position(p.x as u32, p.y as u32);
             }
-            let hit = if is_mouse_button_down(MouseButton::Left) || self.dragging {
+            let hit = if is_mouse_button_down(MouseButton::Left) || self.dragging || self.dd_open.is_some() {
                 vec![Rect::new(0.0, 0.0, sw, sh)]
             } else {
                 let cam = self.camera(false);
@@ -1328,7 +1339,12 @@ impl App {
         }
     }
 
+    /// Plain button; inert while a dropdown is open (its list may be drawn over it).
     fn button(&self, r: Rect, label: &str) -> bool {
+        self.button_live(r, label, self.dd_open.is_none())
+    }
+
+    fn button_live(&self, r: Rect, label: &str, live: bool) -> bool {
         let m: Vec2 = mouse_position().into();
         let hov = r.contains(m);
         let down = hov && is_mouse_button_down(MouseButton::Left);
@@ -1338,7 +1354,84 @@ impl App {
         draw_rectangle(r.x, r.y + off, r.w, r.h, col);
         let w = self.measure(label, 18.0, true).width;
         self.text_c(label, r.center() + vec2(0.0, off), 18.0 * ((r.w - 16.0) / w).min(1.0), WHITE, true);
-        hov && is_mouse_button_pressed(MouseButton::Left)
+        live && hov && is_mouse_button_pressed(MouseButton::Left)
+    }
+
+    /// A button that opens a list of choices (drawn last, on top, by `draw_dropdown`).
+    fn dd_button(&mut self, id: Dd, r: Rect, label: &str) {
+        let live = self.dd_open.is_none() || self.dd_open == Some(id);
+        if self.button_live(r, &format!("{label}  ▾"), live) {
+            self.dd_open = if self.dd_open == Some(id) { None } else { Some(id) };
+        }
+        if self.dd_open == Some(id) {
+            self.dd_menu = Some((id, r));
+        }
+    }
+
+    fn dd_options(&self, id: Dd) -> (Vec<String>, usize) {
+        match id {
+            Dd::Practice => ((0..OPENINGS.len()).map(|i| opening_name(i).to_string()).collect(), self.opening),
+            Dd::Clock => ((0..TCS.len()).map(|i| tc_name(i).to_string()).collect(), self.tc),
+            Dd::Skin => ((0..skins::SKINS.len()).map(|i| skin_name(i).to_string()).collect(), self.skin),
+            Dd::Lang => (vec!["English".into(), "Русский".into()], ru() as usize),
+        }
+    }
+
+    fn dd_apply(&mut self, id: Dd, i: usize) {
+        match id {
+            Dd::Practice if i != self.opening => {
+                self.opening = i;
+                self.new_game(self.player);
+            }
+            Dd::Clock if i != self.tc => {
+                self.tc = i;
+                self.new_game(self.player);
+            }
+            Dd::Skin => self.set_skin(i),
+            Dd::Lang => i18n::set_ru(i == 1),
+            _ => {}
+        }
+    }
+
+    fn draw_dropdown(&mut self) {
+        let Some((id, anchor)) = self.dd_menu.take() else {
+            self.dd_open = None; // its button isn't on screen any more
+            return;
+        };
+        let (opts, sel) = self.dd_options(id);
+        let (sw, sh) = (screen_width(), screen_height());
+        let row = 32.0;
+        let w = anchor.w.max(180.0);
+        let h = row * opts.len() as f32 + 8.0;
+        let x = anchor.x.min(sw - w - 4.0).max(4.0);
+        let y = if anchor.y + anchor.h + h + 4.0 <= sh { anchor.y + anchor.h + 4.0 } else { (anchor.y - h - 4.0).max(4.0) };
+        let list = Rect::new(x, y, w, h);
+        draw_rectangle(x + 3.0, y + 5.0, w, h, Color::new(0.0, 0.0, 0.0, 0.45));
+        draw_rectangle(x, y, w, h, Color::from_rgba(36, 36, 46, 250));
+        draw_rectangle_lines(x, y, w, h, 1.5, Color::from_rgba(90, 90, 115, 255));
+        let m: Vec2 = mouse_position().into();
+        let pressed = is_mouse_button_pressed(MouseButton::Left);
+        let mut chosen = None;
+        for (i, o) in opts.iter().enumerate() {
+            let r = Rect::new(x + 4.0, y + 4.0 + i as f32 * row, w - 8.0, row - 2.0);
+            let hov = r.contains(m);
+            if hov {
+                draw_rectangle(r.x, r.y, r.w, r.h, Color::from_rgba(70, 72, 100, 255));
+            }
+            if i == sel {
+                draw_rectangle(r.x, r.y + 4.0, 3.0, r.h - 8.0, Color::new(0.4, 0.7, 1.0, 1.0));
+            }
+            self.text_fit(o, r.x + 12.0, r.y + 20.0, 15.0, r.w - 20.0, if i == sel { WHITE } else { LIGHTGRAY }, i == sel);
+            if hov && pressed {
+                chosen = Some(i);
+            }
+        }
+        if let Some(i) = chosen {
+            self.dd_open = None;
+            self.dd_apply(id, i);
+        } else if pressed && !list.contains(m) && !anchor.contains(m) {
+            self.dd_open = None;
+        }
     }
 
     fn draw_panel(&mut self) {
@@ -1350,10 +1443,7 @@ impl App {
 
         let e = self.elo_disp.clamp(1.0, MAX_ELO);
         let col = elo_color(e);
-        let magnus = self.tier >= MAGNUS_TIER;
-        if self.button(Rect::new(sw - 62.0, 22.0, 44.0, 30.0), if ru() { "RU" } else { "EN" }) {
-            i18n::set_ru(!ru());
-        }
+        self.dd_button(Dd::Lang, Rect::new(sw - 82.0, 22.0, 64.0, 30.0), if ru() { "RU" } else { "EN" });
         let d = self.text(tr("OPPONENT", "СОПЕРНИК"), x0 + 30.0, 44.0, 16.0, GRAY, true);
         let mood = mood_name(self.mood);
         self.text(&format!("·  {mood}"), x0 + 40.0 + d.width, 44.0, 16.0, mood_color(self.mood), true);
@@ -1401,15 +1491,6 @@ impl App {
             self.text(tier_name(i), b.x + b.w + 26.0 + wob, label_y + 5.0, if i == self.tier { 16.0 } else { 13.0 }, c, i == self.tier);
             self.text(&format!("{:.0}", t.0), b.x + b.w + 212.0, label_y + 5.0, 12.0, with_a(c, 0.6), false);
         }
-        // crown
-        let crown = vec2(b.x + r, b.y - 42.0);
-        if magnus {
-            for i in 0..6 {
-                draw_circle(crown.x, crown.y, 34.0 * (1.0 - i as f32 / 7.0) * (0.9 + 0.1 * (time * 5.0).sin()), Color::new(1.0, 0.8, 0.2, 0.08));
-            }
-        }
-        let cc = if self.tier == MAGNUS_TIER { GOLD } else if magnus { col } else { Color::from_rgba(80, 80, 95, 255) };
-        self.draw_crown(crown, 1.0 + 0.25 * self.tier_pop * magnus as u8 as f32, cc);
 
         // knob: squash/stretch with velocity, pops on every 100 and harder on tier change
         let speed = (self.elo_vel.abs() / 4000.0).min(0.5);
@@ -1427,17 +1508,12 @@ impl App {
         // buttons
         let bw = PANEL - 60.0;
         let by = sh - 210.0;
-        if self.button(Rect::new(x0 + 30.0, by - 108.0, bw, 44.0), &format!("{}: {}", tr("Practice", "Тренировка"), opening_name(self.opening))) {
-            self.opening = (self.opening + 1) % OPENINGS.len();
-            self.new_game(self.player);
-        }
-        if self.button(Rect::new(x0 + 30.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("{}: {}", tr("Clock", "Часы"), tc_name(self.tc))) {
-            self.tc = (self.tc + 1) % TCS.len();
-            self.new_game(self.player);
-        }
-        if self.button(Rect::new(x0 + 35.0 + bw / 2.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &format!("{}: {}", tr("Skin", "Стиль"), skin_name(self.skin))) {
-            self.set_skin(self.skin + 1);
-        }
+        let label = format!("{}: {}", tr("Practice", "Тренировка"), opening_name(self.opening));
+        self.dd_button(Dd::Practice, Rect::new(x0 + 30.0, by - 108.0, bw, 44.0), &label);
+        let label = format!("{}: {}", tr("Clock", "Часы"), tc_name(self.tc));
+        self.dd_button(Dd::Clock, Rect::new(x0 + 30.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &label);
+        let label = format!("{}: {}", tr("Skin", "Стиль"), skin_name(self.skin));
+        self.dd_button(Dd::Skin, Rect::new(x0 + 35.0 + bw / 2.0, by - 54.0, bw / 2.0 - 5.0, 44.0), &label);
         if self.button(Rect::new(x0 + 30.0, by, bw / 2.0 - 5.0, 44.0), tr("Play White", "Играть белыми")) {
             self.new_game(Side::White);
         }
@@ -1470,21 +1546,6 @@ impl App {
         let games = ai::book().games as f32 / 1e6;
         let help = if ru() { format!("прокрутка здесь: Эло · обучены на {games:.1} млн партий Lichess") } else { format!("scroll here: ELO · learned from {games:.1}M Lichess games") };
         self.text_fit(&help, x0 + 30.0, sh - 12.0, 12.0, PANEL - 45.0, GRAY, false);
-    }
-
-    fn draw_crown(&self, c: Vec2, s: f32, col: Color) {
-        let w = 26.0 * s;
-        let h = 18.0 * s;
-        let base = c.y + h / 2.0;
-        let pts = [-w, -w * 0.5, 0.0, w * 0.5, w];
-        for (i, x) in pts.iter().enumerate() {
-            let tip = if i % 2 == 0 { c.y - h } else { c.y - h * 0.3 };
-            draw_triangle(vec2(c.x + x, tip), vec2(c.x + x - w * 0.35, base), vec2(c.x + x + w * 0.35, base), col);
-            if i % 2 == 0 {
-                draw_circle(c.x + x, tip, 3.5 * s, col);
-            }
-        }
-        draw_rectangle(c.x - w, base, w * 2.0, 6.0 * s, col);
     }
 
     fn draw_game_over(&self) {
@@ -1559,11 +1620,12 @@ impl App {
                 "Skin" => format!("{}: {}", tr("Skin", "Стиль"), skin_name(self.skin)),
                 _ => tr("Exit", "Выход").to_string(),
             };
-            if self.button(r, &text) {
+            if label == "Skin" {
+                self.dd_button(Dd::Skin, r, &text);
+            } else if self.button(r, &text) {
                 match label {
                     "Undo" => self.undo(),
                     "New" => self.new_game(self.player),
-                    "Skin" => self.set_skin(self.skin + 1),
                     _ => self.relaunch(false),
                 }
             }
@@ -1631,6 +1693,9 @@ impl App {
 
     fn draw(&mut self) {
         clear_background(if self.overlay.is_some() { overlay::CLEAR } else { Color::from_rgba(20, 20, 26, 255) });
+        if self.editor.is_none() {
+            self.draw_eval_bar();
+        }
         let cam = self.camera(true);
         let wm = cam.screen_to_world(mouse_position().into());
         set_camera(&cam);
@@ -1639,9 +1704,6 @@ impl App {
         self.px_per_unit.set(1.0);
         set_default_camera();
         self.draw_clocks();
-        if self.editor.is_none() {
-            self.draw_eval_bar();
-        }
         if let (Some((name, t)), None) = (&self.opening_name, &self.overlay) {
             let k = (t * 3.0).min(1.0);
             self.text(&opening_label(name, ru()), 20.0 - 20.0 * (1.0 - k), 28.0, 17.0, with_a(Color::new(0.85, 0.75, 0.55, 1.0), k), true);
@@ -1664,6 +1726,7 @@ impl App {
         } else {
             self.draw_panel();
         }
+        self.draw_dropdown();
         self.save_settings();
     }
 }
@@ -1796,6 +1859,8 @@ async fn main() {
         .collect(),
         grass: None,
         editor: None,
+        dd_open: None,
+        dd_menu: None,
         saved: (0.0, usize::MAX, 0, true),
         played: vec![],
         opening: arg("--opening").and_then(|o| o.parse().ok()).filter(|&o: &usize| o < OPENINGS.len()).unwrap_or(0),
