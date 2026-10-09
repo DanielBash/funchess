@@ -15,6 +15,20 @@ use std::f32::consts::PI;
 use skins::{BOARD, SQ};
 const PANEL: f32 = 340.0;
 const STRIP: f32 = 100.0;
+/// The only sizes text is rasterised at (see `text_params`).
+const TEXT_SIZES: [u16; 17] = [8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64];
+
+/// Builds every glyph the UI uses at every text size up front. macroquad's glyph atlas
+/// grows (and swaps its texture) when a new glyph doesn't fit; doing that mid-frame left
+/// already-queued text pointing at a dead texture, which shows up as black boxes.
+fn prebuild_glyphs(font: &Font) {
+    let mut chars: Vec<char> = (' '..='~').collect();
+    chars.extend('А'..='я');
+    chars.extend("ЁёАБВГ·—–…▾↗★✓«»№".chars());
+    for size in TEXT_SIZES {
+        font.populate_font_cache(&chars, size);
+    }
+}
 /// Practice lines: the bot sticks to these while you do, then continues like real players would.
 const OPENINGS: [(&str, &str); 14] = [
     ("Any (bots play like humans)", ""),
@@ -1123,14 +1137,16 @@ impl App {
         draw_texture_ex(&sp.tex, left, top, with_a(WHITE, alpha), dest(w, h));
     }
 
-    /// Text is rasterised at the size it appears on screen (scaling one big raster down
-    /// blurs small labels and makes pairs like "To" overlap). On the zoomable board,
-    /// `px_per_unit` is the camera scale so it stays crisp when zoomed.
+    /// Text is rasterised close to the size it appears on screen (shrinking one big raster
+    /// blurs small labels and makes pairs like "To" overlap), but only at a fixed set of
+    /// sizes: macroquad's glyph cache doubles its texture whenever it fills and never
+    /// shrinks, so every animated size getting its own glyphs eventually outgrows the GPU
+    /// and text turns into black boxes. On the zoomable board `px_per_unit` is the camera scale.
     fn text_params(&self, size: f32, bold: bool) -> (Option<&Font>, u16, f32) {
-        let k = self.px_per_unit.get();
         let font = if bold { &self.bold } else { &self.font };
-        let px = (size * k).round().max(1.0);
-        (Some(font), px as u16, size / px)
+        let px = size * self.px_per_unit.get();
+        let raster = TEXT_SIZES.iter().copied().find(|&s| s as f32 >= px).unwrap_or(64);
+        (Some(font), raster, size / raster as f32)
     }
 
     fn measure(&self, s: &str, size: f32, bold: bool) -> TextDimensions {
@@ -1451,7 +1467,7 @@ impl App {
         let num_col = if self.tier == MAGNUS_TIER { Color::new(1.0, 0.8 + 0.15 * (time * 6.0).sin(), 0.25, 1.0) } else { col };
         let d = self.text(&format!("{:.0}", e), x0 + 30.0, 108.0, 60.0 * pop, num_col, true);
         self.text(tr("ELO", "ЭЛО"), x0 + 40.0 + d.width, 108.0, 18.0, GRAY, true);
-        self.text(tier_name(self.tier), x0 + 30.0, 145.0, 24.0 * (1.0 + 0.2 * self.tier_pop), col, true);
+        self.text_fit(tier_name(self.tier), x0 + 30.0, 145.0, 24.0 * (1.0 + 0.2 * self.tier_pop), PANEL - 45.0, col, true);
 
         // the bar
         let b = self.bar_rect();
@@ -1461,8 +1477,23 @@ impl App {
         draw_circle(b.x + r, b.y, r, track);
         draw_circle(b.x + r, b.y + b.h, r, track);
         let ky = self.knob_y().clamp(b.y, b.y + b.h);
-        draw_rectangle(b.x - 6.0, ky, b.w + 12.0, b.y + b.h - ky, with_a(col, 0.12 + 0.08 * self.tier_pop));
-        draw_circle(b.x + r, b.y + b.h, r, elo_color(1.0));
+        let full = ky <= b.y + 0.5;
+        // fill colour (with the travelling shimmer) at a height on the bar
+        let fill_at = |y: f32| {
+            let c = elo_color(frac_elo((b.y + b.h - y) / b.h));
+            let shim = 0.18 * ((time * 3.0 + y * 0.04).sin()).max(0.0).powi(4);
+            Color::new((c.r + shim).min(1.0), (c.g + shim).min(1.0), (c.b + shim).min(1.0), 1.0)
+        };
+        // glow follows the whole filled capsule, rounded ends included
+        let glow_top = if full { b.y - r } else { ky };
+        for (grow, a) in [(10.0, 0.05), (6.0, 0.07), (3.0, 0.1)] {
+            let g = with_a(col, a + 0.06 * self.tier_pop);
+            draw_rectangle(b.x - grow, glow_top, b.w + 2.0 * grow, b.y + b.h - glow_top, g);
+            draw_circle(b.x + r, b.y + b.h, r + grow, g);
+            if full {
+                draw_circle(b.x + r, b.y, r + grow, g);
+            }
+        }
         let n = 90;
         for i in 0..n {
             let y1 = b.y + b.h * (1.0 - i as f32 / n as f32);
@@ -1470,10 +1501,12 @@ impl App {
             if y1 <= ky {
                 break;
             }
-            let c = elo_color(frac_elo(i as f32 / n as f32));
-            let shim = 0.18 * ((time * 3.0 + y0 * 0.04).sin()).max(0.0).powi(4);
-            let c = Color::new((c.r + shim).min(1.0), (c.g + shim).min(1.0), (c.b + shim).min(1.0), 1.0);
-            draw_rectangle(b.x, y0.max(ky), b.w, y1 - y0.max(ky), c);
+            draw_rectangle(b.x, y0.max(ky), b.w, y1 - y0.max(ky), fill_at(y0));
+        }
+        // rounded ends share the fill's colour and shimmer
+        draw_circle(b.x + r, b.y + b.h, r, fill_at(b.y + b.h));
+        if full {
+            draw_circle(b.x + r, b.y, r, fill_at(b.y));
         }
         // tier ladder
         let mut label_y = f32::MAX;
@@ -1787,6 +1820,8 @@ fn conf() -> Conf {
 async fn main() {
     let font = load_ttf_font_from_bytes(include_bytes!("../assets/DejaVuSans.ttf")).unwrap();
     let bold = load_ttf_font_from_bytes(include_bytes!("../assets/DejaVuSans-Bold.ttf")).unwrap();
+    prebuild_glyphs(&font);
+    prebuild_glyphs(&bold);
     let engine = match ai::spawn() {
         Ok(e) => e,
         Err(e) => loop {
