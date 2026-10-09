@@ -326,7 +326,9 @@ struct App {
     clock: [f32; 2], // indexed by Side as usize: black 0, white 1
     mood: ai::Mood,
     overlay: Option<overlay::Overlay>,
-    analysis: Option<(usize, Vec<(Move, i32)>)>,
+    grade_shown: f64,
+    /// Evaluation bar: target and animated value, centipawns from White's side.
+    eval: (i32, f32),
     analysed: Option<(u64, usize)>,
     want_grade: Option<(usize, Chess, Move, Square)>,
     badge: Option<(Square, Grade, f32)>,
@@ -388,7 +390,6 @@ impl App {
         self.waiting = false;
         self.pending = None;
         self.over_t = 0.0;
-        self.analysis = None;
         self.want_grade = None;
         self.badge = None;
         self.engine.stop();
@@ -463,12 +464,12 @@ impl App {
         }
     }
 
-    fn try_grade(&mut self) {
-        let (Some((ply, before, m, sq)), Some((aply, lines))) = (&self.want_grade, &self.analysis) else { return };
-        if ply != aply {
+    fn on_grade(&mut self, ply: usize, grade: Option<Grade>) {
+        let Some((wply, before, m, sq)) = &self.want_grade else { return };
+        if *wply != ply {
             return;
         }
-        let (sq, grade) = (*sq, ai::classify(before, lines, *m));
+        let sq = *sq;
         // a sound move that lots of real players play here = book
         let pop = ai::book().all(book::key(before));
         let total: u32 = pop.iter().map(|b| b.count).sum();
@@ -480,6 +481,7 @@ impl App {
         self.want_grade = None;
         let Some(g) = grade else { return };
         self.badge = Some((sq, g, 0.0));
+        self.grade_shown = get_time();
         let c = self.sq_pos(sq);
         let col = grade_color(g);
         let label = match g {
@@ -612,12 +614,15 @@ impl App {
             m.capture().map(|_| m.to())
         };
         let ghost = cap_sq.and_then(|s| self.pos.board().piece_at(s).map(|p| (p, self.sq_pos(s))));
-        self.badge = None;
+        // your badge stays up until your next move (or until the bot lands on it)
+        if mover == self.player || self.badge.is_some_and(|b| b.0 == to) {
+            self.badge = None;
+        }
         if mover == self.player {
             self.want_grade = Some((self.history.len(), self.pos.clone(), m, to));
-            if self.analysis.as_ref().map(|a| a.0) != Some(self.history.len()) {
-                self.engine.stop(); // analysis still running: take what it has now
-            }
+            self.engine.stop(); // end the warm-up; the grade gets its own focused search
+            let req = ai::Req::Grade { game_id: self.game_id, ply: self.history.len(), before: self.pos.clone(), played: m };
+            let _ = self.engine.tx.send(req);
         }
         self.history.push(self.pos.clone());
         self.played.push(m);
@@ -637,7 +642,6 @@ impl App {
         self.last = Some((from, to));
         self.sel = None;
         self.dragging = false;
-        self.try_grade();
     }
 
     fn landed(&mut self, a: Anim) {
@@ -809,8 +813,14 @@ impl App {
         for t in &mut self.toasts {
             t.t += dt;
         }
-        self.toasts.retain(|t| t.t < 1.6);
+        self.toasts.retain(|t| t.t < 2.6);
         self.sel_t += dt;
+        if self.pos.is_checkmate() {
+            self.eval.0 = if self.pos.turn().is_white() { -30000 } else { 30000 };
+        } else if self.pos.is_game_over() {
+            self.eval.0 = 0;
+        }
+        self.eval.1 += (book::win_pct(self.eval.0) - self.eval.1) * (1.0 - (-dt * 5.0).exp());
         if let Some(o) = &mut self.opening_name {
             o.1 += dt;
         }
@@ -892,7 +902,7 @@ impl App {
                 let msg = if ru() { format!("Ловушка! {pct:.0}% игроков здесь ошибаются") } else { format!("Trap! {pct:.0}% of players go wrong here") };
                 self.toast(&msg, vec2(BOARD / 2.0, BOARD / 2.0), Color::new(1.0, 0.5, 0.3, 1.0));
             }
-            let _ = self.engine.tx.send(ai::Req::Analyse { game_id: key.0, ply: key.1, pos: self.pos.clone() });
+            let _ = self.engine.tx.send(ai::Req::Analyse { game_id: self.game_id, pos: self.pos.clone() });
         }
         while let Ok(r) = self.engine.rx.try_recv() {
             match r {
@@ -921,15 +931,15 @@ impl App {
                         self.pending = Some((m, tag, self.think_start + think as f64));
                     }
                 }
-                ai::Reply::Analysis { game_id, ply, lines } if game_id == self.game_id => {
-                    self.analysis = Some((ply, lines));
-                    self.try_grade();
-                }
+                ai::Reply::Grade { game_id, ply, grade } if game_id == self.game_id => self.on_grade(ply, grade),
+                ai::Reply::Eval { game_id, white_cp } if game_id == self.game_id => self.eval.0 = white_cp,
                 _ => {}
             }
         }
         if let Some((m, tag, at)) = self.pending.clone() {
-            if get_time() >= at && self.anim.is_none() {
+            // give the player a moment to see their grade before the bot replies
+            let ready = self.want_grade.is_none() && get_time() >= at.max(self.grade_shown + 1.2);
+            if ready && self.anim.is_none() {
                 self.pending = None;
                 self.play(m, None, tag);
             }
@@ -1256,7 +1266,7 @@ impl App {
         self.draw_particles(false);
         for t in &self.toasts {
             let pop = ease_out_back((t.t * 5.0).min(1.0));
-            let a = (1.6 - t.t).min(0.4) / 0.4;
+            let a = (2.6 - t.t).min(0.5) / 0.5;
             let c = t.p - vec2(0.0, t.t * 30.0);
             for i in 0..8 {
                 let o = vec2((i as f32 * PI / 4.0).cos(), (i as f32 * PI / 4.0).sin()) * 2.0;
@@ -1560,6 +1570,43 @@ impl App {
         self.draw_particles(true);
     }
 
+    /// Lichess-style bar left of the board: White's share of the win chances, with the score.
+    fn draw_eval_bar(&self) {
+        let (sw, sh) = (screen_width(), screen_height());
+        let area_w = sw - self.panel_w();
+        let area_h = sh - self.strip_h();
+        let margin = if self.overlay.is_some() { 0.95 } else { 0.86 };
+        let size = area_w.min(area_h) * margin;
+        let left = area_w / 2.0 - size / 2.0;
+        let top = area_h / 2.0 - size / 2.0;
+        let (w, x) = if self.overlay.is_some() { (8.0, (left - 12.0).max(2.0)) } else { (24.0, (left - 52.0).max(6.0)) };
+        let white = (self.eval.1 / 100.0).clamp(0.0, 1.0);
+        // White's part sits on White's side of the board
+        let white_h = size * white;
+        let flipped = self.player == Side::Black;
+        draw_rectangle(x - 2.0, top - 2.0, w + 4.0, size + 4.0, Color::new(0.0, 0.0, 0.0, 0.5));
+        draw_rectangle(x, top, w, size, Color::from_rgba(52, 52, 58, 255));
+        let wy = if flipped { top } else { top + size - white_h };
+        draw_rectangle(x, wy, w, white_h, Color::from_rgba(238, 238, 232, 255));
+        let edge = if flipped { top + white_h } else { top + size - white_h };
+        draw_line(x - 3.0, edge, x + w + 3.0, edge, 2.0, Color::new(1.0, 0.75, 0.2, 0.9));
+        draw_line(x, top + size / 2.0, x + w, top + size / 2.0, 1.0, Color::new(0.5, 0.5, 0.5, 0.6));
+        if self.overlay.is_none() {
+            let cp = self.eval.0;
+            let label = if cp.abs() >= 29000 {
+                format!("M{}", (30000 - cp.abs()) / 10)
+            } else {
+                format!("{:.1}", cp.abs() as f32 / 100.0)
+            };
+            // printed in the leading side's colour, at that side's end of the bar
+            let white_leads = cp >= 0;
+            let at_bottom = white_leads != flipped;
+            let y = if at_bottom { top + size - 9.0 } else { top + 11.0 };
+            let col = if white_leads { Color::from_rgba(40, 40, 46, 255) } else { Color::from_rgba(238, 238, 232, 255) };
+            self.text_c(&label, vec2(x + w / 2.0, y), 10.0, col, true);
+        }
+    }
+
     fn draw_clocks(&self) {
         if self.tc == 0 || self.overlay.is_some() {
             return;
@@ -1591,6 +1638,9 @@ impl App {
         self.px_per_unit.set(1.0);
         set_default_camera();
         self.draw_clocks();
+        if self.editor.is_none() {
+            self.draw_eval_bar();
+        }
         if let (Some((name, t)), None) = (&self.opening_name, &self.overlay) {
             let k = (t * 3.0).min(1.0);
             self.text(&opening_label(name, ru()), 20.0 - 20.0 * (1.0 - k), 28.0, 17.0, with_a(Color::new(0.85, 0.75, 0.55, 1.0), k), true);
@@ -1754,7 +1804,8 @@ async fn main() {
         clock,
         mood: ai::Mood::Calm,
         overlay: overlay_mode().then(overlay::Overlay::default),
-        analysis: None,
+        grade_shown: 0.0,
+        eval: (20, 51.8),
         analysed: None,
         want_grade: None,
         badge: None,

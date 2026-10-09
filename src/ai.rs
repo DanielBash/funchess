@@ -13,13 +13,19 @@ use std::sync::{Arc, Mutex};
 pub enum Req {
     /// `clock` = bot's remaining seconds, if a time control is on.
     Think { game_id: u64, pos: Chess, elo: f32, clock: Option<f32> },
-    Analyse { game_id: u64, ply: usize, pos: Chess },
+    /// Warm-up while the player thinks (fills the engine's hash so grading is quick and deep).
+    Analyse { game_id: u64, pos: Chess },
+    /// Grade the player's move: searches before and after it.
+    Grade { game_id: u64, ply: usize, before: Chess, played: Move },
 }
 
 pub enum Reply {
     /// `real`: the real Lichess game this move came from (url, description).
     Move { game_id: u64, mv: Option<Move>, tag: Option<String>, mood: Mood, real: Option<(String, String)> },
-    Analysis { game_id: u64, ply: usize, lines: Vec<(Move, i32)> },
+    Grade { game_id: u64, ply: usize, grade: Option<Grade> },
+    /// Evaluation of the current position, centipawns from White's side (mates as ±30000).
+    Eval { game_id: u64, white_cp: i32 },
+    Nothing,
 }
 
 pub const MAGNUS: f32 = 2850.0;
@@ -64,6 +70,8 @@ pub fn spawn() -> Result<Engine, String> {
     let mut out = BufReader::new(child.stdout.take().unwrap());
     send(&stdin, "uci\n");
     read_until(&mut out, "uciok");
+    send(&stdin, "setoption name Threads value 2\nsetoption name Hash value 128\nisready\n");
+    read_until(&mut out, "readyok");
 
     let (tx, req_rx) = channel::<Req>();
     let (rep_tx, rx) = channel();
@@ -85,15 +93,30 @@ pub fn spawn() -> Result<Engine, String> {
                         }
                         None => {
                             channel = None;
-                            let (mv, tag, mood) = think(&inp, &mut out, &pos, elo, clock);
+                            let (mv, tag, mood, eval) = think(&inp, &mut out, &pos, elo, clock);
+                            if let Some(cp) = eval {
+                                let sign = if pos.turn().is_white() { 1 } else { -1 };
+                                let _ = rep_tx.send(Reply::Eval { game_id, white_cp: sign * cp });
+                            }
                             Reply::Move { game_id, mv, tag, mood, real: None }
                         }
                     }
                 }
-                Req::Analyse { game_id, ply, pos } => {
-                    // every legal move gets a score; the UI stops this the moment the player moves
-                    let lines = search(&inp, &mut out, &pos, 256, "depth 16");
-                    Reply::Analysis { game_id, ply, lines }
+                Req::Analyse { game_id, pos } => {
+                    // runs until the player moves (the UI sends "stop"), streaming the eval bar
+                    let sign = if pos.turn().is_white() { 1 } else { -1 };
+                    search_live(&inp, &mut out, &pos, 2, "depth 40 movetime 120000", &mut |cp| {
+                        let _ = rep_tx.send(Reply::Eval { game_id, white_cp: sign * cp });
+                    });
+                    Reply::Nothing
+                }
+                Req::Grade { game_id, ply, before, played } => {
+                    let (grade, after_cp) = grade(&inp, &mut out, &before, played).unzip();
+                    if let Some(cp) = after_cp {
+                        let sign = if before.turn().is_white() { 1 } else { -1 };
+                        let _ = rep_tx.send(Reply::Eval { game_id, white_cp: sign * cp });
+                    }
+                    Reply::Grade { game_id, ply, grade }
                 }
             };
             if rep_tx.send(reply).is_err() {
@@ -125,28 +148,69 @@ fn read_until(out: &mut BufReader<ChildStdout>, prefix: &str) -> Vec<String> {
 
 /// (move, centipawns for the side to move), best first.
 fn search(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess, multipv: usize, go: &str) -> Vec<(Move, i32)> {
+    search_live(inp, out, pos, multipv, go, &mut |_| {})
+}
+
+/// `on_eval` gets the top line's score each time a deeper iteration completes.
+fn search_live(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess, multipv: usize, go: &str, on_eval: &mut dyn FnMut(i32)) -> Vec<(Move, i32)> {
     let fen = Fen::from_position(pos, EnPassantMode::Legal);
     send(inp, &format!("setoption name MultiPV value {multipv}\nposition fen {fen}\ngo {go}\n"));
-    let mut lines: Vec<Option<(Move, i32)>> = vec![];
-    for l in read_until(out, "bestmove") {
+    // per move: (depth, score); only exact scores (bound lines are search-window guesses),
+    // and the deepest one wins, so a search stopped mid-iteration doesn't mix up moves
+    let mut seen: Vec<(Move, u32, i32)> = vec![];
+    let mut s = String::new();
+    while out.read_line(&mut s).unwrap_or(0) > 0 {
+        let l = std::mem::take(&mut s);
+        if l.starts_with("bestmove") {
+            break;
+        }
+        if l.contains("bound") {
+            continue;
+        }
         let t: Vec<&str> = l.split_whitespace().collect();
         let at = |k: &str| t.iter().position(|x| *x == k).and_then(|i| t.get(i + 1));
-        let (Some(k), Some(kind), Some(pv)) = (at("multipv"), at("score"), at("pv")) else { continue };
-        let Some(v) = at(kind).and_then(|v| v.parse::<i32>().ok()) else { continue };
+        let (Some(d), Some(kind), Some(pv)) = (at("depth"), at("score"), at("pv")) else { continue };
+        let (Ok(d), Some(v)) = (d.parse::<u32>(), at(kind).and_then(|v| v.parse::<i32>().ok())) else { continue };
         let cp = if *kind == "mate" { if v > 0 { 30000 - v * 10 } else { -30000 - v * 10 } } else { v };
         let Ok(m) = pv.parse::<UciMove>().map_err(|_| ()).and_then(|u| u.to_move(pos).map_err(|_| ())) else { continue };
-        let k: usize = k.parse().unwrap_or(1);
-        if lines.len() < k {
-            lines.resize(k, None);
+        if at("multipv").is_none_or(|k| *k == "1") {
+            on_eval(cp);
         }
-        lines[k - 1] = Some((m, cp));
+        match seen.iter_mut().find(|x| x.0 == m) {
+            Some(x) if d >= x.1 => *x = (m, d, cp),
+            Some(_) => {}
+            None => seen.push((m, d, cp)),
+        }
     }
-    let mut lines: Vec<_> = lines.into_iter().flatten().collect();
-    lines.sort_by_key(|l| -l.1); // a stopped search can leave slots out of order
+    // a deep line is worth more than a shallow one that happens to score higher
+    let deepest = seen.iter().map(|x| x.1).max().unwrap_or(0);
+    let mut lines: Vec<(Move, i32)> = seen.iter().filter(|x| x.1 + 2 >= deepest).map(|x| (x.0, x.2)).collect();
+    lines.sort_by_key(|l| -l.1);
     lines
 }
 
-fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess, e: f32, clock: Option<f32>) -> (Option<Move>, Option<String>, Mood) {
+/// Grades the player's move: eval of the best move before it vs the eval after it.
+fn grade(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, before: &Chess, played: Move) -> Option<(Grade, i32)> {
+    let lines = search(inp, out, before, 2, "depth 18 movetime 1500");
+    let &(best_mv, best) = lines.first()?;
+    let second = lines.get(1).map_or(-30000, |l| l.1);
+    let cp = if played == best_mv {
+        best
+    } else {
+        let mut after = before.clone();
+        after.play_unchecked(played);
+        if after.is_checkmate() {
+            30000
+        } else if after.is_game_over() {
+            0
+        } else {
+            -search(inp, out, &after, 1, "depth 17 movetime 1200").first()?.1
+        }
+    };
+    Some((classify(before, best_mv, best, second, played, cp), cp))
+}
+
+fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess, e: f32, clock: Option<f32>) -> (Option<Move>, Option<String>, Mood, Option<i32>) {
     let bk = book();
     let band = book::band(e);
     // 1. In known positions, choose among the moves real players of this rating make here,
@@ -180,7 +244,7 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
                         format!("Scores {:.0}% vs {} players", s * 100.0, book::band_label(band))
                     }
                 });
-                return (Some(mv), tag, Mood::Calm);
+                return (Some(mv), tag, Mood::Calm, None);
             }
         }
     }
@@ -189,11 +253,6 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
     //    human makes, using real best/good/inaccuracy/mistake/blunder rates for this
     //    rating band and clock situation (from Lichess games with computer analysis).
     let hurry = clock.map_or(0.0, |t| ((20.0 - t) / 20.0).clamp(0.0, 1.0));
-    let beyond = (e - MAGNUS).max(0.0);
-    let depth = (((12.0 + beyond / 100.0) * (1.0 - 0.5 * hurry)) as u32).max(2);
-    let movetime = ((2500.0 + beyond * 4.0) * (1.0 - 0.9 * hurry)) as u32;
-    let lines = search(inp, out, pos, 40, &format!("depth {depth} movetime {movetime}"));
-    let Some(&(best_mv, best)) = lines.first() else { return (None, None, Mood::Calm) };
 
     // phase-specific: e.g. real 1200s botch rook endings far more often than openings
     let ply = (pos.fullmoves().get() as usize - 1) * 2 + pos.turn().is_black() as usize;
@@ -216,6 +275,16 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
     if e < 400.0 && gen_range(0.0, 1.0) < (400.0 - e) / 800.0 {
         target = book::CATS - 1; // below the data: pure potato chaos
     }
+    // Rolled a good move (most moves for strong bots): a focused, deep search.
+    // Rolled a slip: a wide, shallow one, so there are slips to choose from.
+    let lines = if target == 0 {
+        let depth = ((10.0 + e / 220.0) * (1.0 - 0.5 * hurry)).max(2.0) as u32;
+        let ms = ((600.0 + e * 0.8) * (1.0 - 0.9 * hurry)) as u32;
+        search(inp, out, pos, 5, &format!("depth {depth} movetime {ms}"))
+    } else {
+        search(inp, out, pos, 40, &format!("depth 10 movetime {}", (1500.0 * (1.0 - 0.9 * hurry)) as u32))
+    };
+    let Some(&(best_mv, best)) = lines.first() else { return (None, None, Mood::Calm, None) };
     let decided = !(3.0..97.0).contains(&book::win_pct(best));
     if decided {
         target = 0;
@@ -238,24 +307,35 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
         Mood::Defending => 0.4,
         _ => 1.0,
     };
+    // a forced mate on the board: decent players see it and take the shortest one
+    if best >= 29000 && (e >= 1600.0 || gen_range(0.0, 1600.0) < e) {
+        return (Some(best_mv), None, mood, Some(best));
+    }
     // the move kind we rolled may not exist here (nothing to blunder): settle for the next best kind
     let cat_of = |cp: i32| book::cat(book::win_pct(best) - book::win_pct(cp));
     while target > 0 && !lines.iter().any(|l| cat_of(l.1) == target) {
         target -= 1;
     }
+    // "good" moves: within a centipawn window of the best that narrows with strength
+    // (win% saturates in won positions, where it would call everything good)
+    let window = 10.0 + 150.0 * (-e / 550.0).exp();
+    let fits = |cp: i32| if target == 0 { (best - cp) as f32 <= window } else { cat_of(cp) == target };
+    // human flavour (style, reactions, plans) fades as strength grows
+    let flavour = (1.1 - e / 3000.0).clamp(0.08, 1.0);
     let mut pick = (best_mv, best, 0.0, None, f32::MIN);
-    for &(m, cp) in lines.iter().filter(|l| cat_of(l.1) == target) {
+    for &(m, cp) in lines.iter().filter(|l| fits(l.1)) {
         let st = style(pos, m, e, best);
         let (react, why) = react(pos, m);
         let mut after = pos.clone();
         after.play_unchecked(m);
         let plan = match mood {
             Mood::Defending => 25.0 * (danger - king_pressure(after.board(), us)) as f32,
-            Mood::Attacking => 15.0 * (king_pressure(after.board(), !us) - chances) as f32,
+            // pieces join the attack; pawn storms aren't rewarded on principle
+            Mood::Attacking if m.role() != Role::Pawn => 15.0 * (king_pressure(after.board(), !us) - chances) as f32,
             _ => 0.0,
         };
         // within the kind of move, humans pick the natural-looking one
-        let s = 0.3 * cp.clamp(-1500, 1500) as f32 + spice * st + react + plan + gauss() * 20.0;
+        let s = cp.clamp(-1500, 1500) as f32 + flavour * (spice * st + react + plan) + gauss() * (4.0 + 16.0 * flavour);
         if s > pick.4 {
             pick = (m, cp, st, why, s);
         }
@@ -269,7 +349,8 @@ fn think(inp: &Mutex<ChildStdin>, out: &mut BufReader<ChildStdout>, pos: &Chess,
         _ if pick.0 != best_mv && pick.2 >= 40.0 => Some(tr("Cheeky!", "Нахально!")),
         _ => None,
     };
-    (Some(pick.0), tag.map(str::to_string), mood)
+    // the bar shows what the chosen move is worth, slips included
+    (Some(pick.0), tag.map(str::to_string), mood, Some(pick.1))
 }
 
 /// (position key, real game index, ply) for every kept game position, sorted by key.
@@ -430,7 +511,7 @@ fn style(pos: &Chess, m: Move, e: f32, best: i32) -> f32 {
         s += 35.0; // beginners love the queen
     }
     let r = m.to().rank().to_u32();
-    if m.role() == Role::Pawn && (if pos.turn().is_white() { r >= 4 } else { r <= 3 }) {
+    if e < 1500.0 && m.role() == Role::Pawn && (if pos.turn().is_white() { r >= 4 } else { r <= 3 }) {
         s += 15.0;
     }
     if m.is_castle() {
@@ -484,13 +565,10 @@ impl Grade {
 }
 
 /// Win% swing, lichess-style. `lines` = analysis of `pos` before the move.
-pub fn classify(pos: &Chess, lines: &[(Move, i32)], played: Move) -> Option<Grade> {
-    let &(best_mv, best) = lines.first()?;
-    let &(_, cp) = lines.iter().find(|l| l.0 == played)?;
+pub fn classify(pos: &Chess, best_mv: Move, best: i32, second: i32, played: Move, cp: i32) -> Grade {
     let wp = book::win_pct;
     let loss = wp(best) - wp(cp);
-    let second = lines.get(1).map_or(-30000, |l| l.1);
-    Some(match loss {
+    match loss {
         _ if loss <= 2.0 && wp(cp) > 30.0 && wp(best) < 97.0 && is_sacrifice(pos, played) => Grade::Brilliant,
         _ if played == best_mv && wp(best) - wp(second) >= 15.0 => Grade::Great,
         _ if played == best_mv || loss <= 0.5 => Grade::Best,
@@ -499,7 +577,7 @@ pub fn classify(pos: &Chess, lines: &[(Move, i32)], played: Move) -> Option<Grad
         l if l < 10.0 => Grade::Inaccuracy,
         l if l < 20.0 => Grade::Mistake,
         _ => Grade::Blunder,
-    })
+    }
 }
 
 /// A non-pawn piece left where it can be taken for less than it's worth.
@@ -522,7 +600,11 @@ mod tests {
         let pos = Chess::default();
         for elo in [1.0, 800.0, 1600.0, 2400.0, MAGNUS, MAX_ELO] {
             e.tx.send(Req::Think { game_id: 0, pos: pos.clone(), elo, clock: Some(5.0) }).unwrap();
-            let Reply::Move { mv, .. } = e.rx.recv().unwrap() else { panic!() };
+            let mv = loop {
+                if let Reply::Move { mv, .. } = e.rx.recv().unwrap() {
+                    break mv;
+                }
+            };
             assert!(pos.is_legal(mv.unwrap()), "elo {elo}");
         }
     }
@@ -532,13 +614,22 @@ mod tests {
         let e = spawn().unwrap();
         let grade = |fen: &str, uci: &str| {
             let pos: Chess = fen.parse::<Fen>().unwrap().into_position(shakmaty::CastlingMode::Standard).unwrap();
-            e.tx.send(Req::Analyse { game_id: 0, ply: 0, pos: pos.clone() }).unwrap();
-            let Reply::Analysis { lines, .. } = e.rx.recv().unwrap() else { panic!() };
             let m = uci.parse::<UciMove>().unwrap().to_move(&pos).unwrap();
-            classify(&pos, &lines, m)
+            e.tx.send(Req::Grade { game_id: 0, ply: 0, before: pos.clone(), played: m }).unwrap();
+            let grade = loop {
+                if let Reply::Grade { grade, .. } = e.rx.recv().unwrap() {
+                    break grade;
+                }
+            };
+            grade
         };
         // hanging the queen for nothing
         assert_eq!(grade("rnbqkbnr/ppp1pppp/3p4/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", "d1g4"), Some(Grade::Blunder));
+        let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        let g = grade(start, "g1f3");
+        assert!(matches!(g, Some(Grade::Best | Grade::Excellent | Grade::Great)), "Nf3: {g:?}");
+        let g = grade(start, "g2g4");
+        assert!(matches!(g, Some(Grade::Inaccuracy | Grade::Mistake)), "g4: {g:?}");
         // stockfish's own top choice can't be worse than Best
         let g = grade("rnbqkbnr/ppp1pppp/3p4/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", "d2d4");
         assert!(matches!(g, Some(Grade::Brilliant | Grade::Great | Grade::Best | Grade::Excellent)), "{g:?}");
@@ -568,7 +659,11 @@ mod book_tests {
             let mut seen: Vec<String> = vec![];
             for _ in 0..12 {
                 e.tx.send(Req::Think { game_id: 0, pos: Chess::default(), elo, clock: None }).unwrap();
-                let Reply::Move { mv, tag, real, .. } = e.rx.recv().unwrap() else { panic!() };
+                let (mv, tag, real) = loop {
+                    if let Reply::Move { mv, tag, real, .. } = e.rx.recv().unwrap() {
+                        break (mv, tag, real);
+                    }
+                };
                 assert!(real.is_none(), "start position is never a replay");
                 let mv = mv.unwrap();
                 assert!(book().moves(book::key(&Chess::default()), book::band(elo)).unwrap().iter().any(|b| b.mv == book::encode(mv)));
@@ -600,4 +695,90 @@ fn beyond_magnus_slips_less_and_theoretical_human_never_does() {
     println!("middlegame slip factor: {f:?}");
     assert!(f.windows(2).all(|w| w[1] <= w[0]), "{f:?}");
     assert_eq!(f[5], 0.0);
+}
+
+/// `cargo test --release measure_strength -- --ignored --nocapture`: how well top bots
+/// actually play in real middlegames (average centipawn loss vs a deep reference search).
+#[cfg(test)]
+#[test]
+#[ignore]
+fn measure_strength() {
+    let e = spawn().unwrap();
+    let inp = e.stdin.clone();
+    let (tx, rx) = (e.tx, e.rx);
+    let bk = book();
+    let positions: Vec<Chess> = bk
+        .games_kept
+        .iter()
+        .filter(|g| g.elo[1] >= 2200 && g.moves.len() > 40)
+        .take(20)
+        .map(|g| {
+            let mut p = Chess::default();
+            for &c in &g.moves[..26] {
+                let m = book::decode(c, &p).unwrap();
+                p.play_unchecked(m);
+            }
+            p
+        })
+        .collect();
+    for elo in [2000.0, MAGNUS, MAX_ELO] {
+        let (mut loss, mut top, mut pawns) = (0, 0, 0);
+        for pos in &positions {
+            tx.send(Req::Think { game_id: 0, pos: pos.clone(), elo, clock: None }).unwrap();
+            let mv = loop {
+                if let Reply::Move { mv, .. } = rx.recv().unwrap() {
+                    break mv.unwrap();
+                }
+            };
+            // reference: separate deep searches through a second engine
+            let (_, mut out2, inp2) = reference_engine();
+            let best = search(&inp2, &mut out2, pos, 1, "depth 18")[0].clone();
+            let mut after = pos.clone();
+            after.play_unchecked(mv);
+            let got = if after.is_game_over() { best.1 } else { -search(&inp2, &mut out2, &after, 1, "depth 17")[0].1 };
+            loss += (best.1 - got).clamp(0, 1000);
+            top += (best.0 == mv) as u32;
+            pawns += (mv.role() == Role::Pawn) as u32;
+        }
+        let n = positions.len() as f32;
+        println!("elo {elo}: avg centipawn loss {:.0}, top-move {:.0}%, pawn moves {:.0}%", loss as f32 / n, 100.0 * top as f32 / n, 100.0 * pawns as f32 / n);
+    }
+    let _ = inp;
+}
+
+#[cfg(test)]
+fn reference_engine() -> (std::process::Child, BufReader<ChildStdout>, Mutex<ChildStdin>) {
+    let mut c = Command::new(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("stockfish"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let inp = Mutex::new(c.stdin.take().unwrap());
+    let mut out = BufReader::new(c.stdout.take().unwrap());
+    send(&inp, "uci\nsetoption name Hash value 64\n");
+    read_until(&mut out, "uciok");
+    (c, out, inp)
+}
+
+#[cfg(test)]
+#[test]
+#[ignore]
+fn measure_mates() {
+    let e = spawn().unwrap();
+    for (fen, mate) in [("7k/8/6K1/8/8/8/8/1Q6 w - - 0 1", "b1b8"), ("6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1", "d1d8")] {
+        let pos: Chess = fen.parse::<Fen>().unwrap().into_position(shakmaty::CastlingMode::Standard).unwrap();
+        for elo in [1500.0, MAGNUS, MAX_ELO] {
+            let mut found = 0;
+            for _ in 0..10 {
+                e.tx.send(Req::Think { game_id: 0, pos: pos.clone(), elo, clock: None }).unwrap();
+                let m = loop {
+                    if let Reply::Move { mv, .. } = e.rx.recv().unwrap() {
+                        break mv.unwrap();
+                    }
+                };
+                found += (m.to_uci(shakmaty::CastlingMode::Standard).to_string() == mate) as u32;
+            }
+            println!("{fen} elo {elo}: mate-in-1 found {found}/10");
+        }
+    }
 }
