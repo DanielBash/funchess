@@ -348,6 +348,7 @@ impl App {
         self.real_game = None;
         self.clock = [TCS[self.tc].1; 2];
         self.mood = ai::Mood::Calm;
+        self.eval = (20, book::win_pct(20)); // don't carry the last game's bar over
         self.reset_turn_state();
     }
 
